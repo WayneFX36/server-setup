@@ -50,9 +50,23 @@
 
 ## Быстрый старт
 
+**curl:**
 ```bash
+curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/main/server-setup.sh -o server-setup.sh
 chmod +x server-setup.sh
 sudo bash server-setup.sh
+```
+
+**wget:**
+```bash
+wget -q https://raw.githubusercontent.com/WayneFX36/server-setup/main/server-setup.sh
+chmod +x server-setup.sh
+sudo bash server-setup.sh
+```
+
+**Или сразу запустить без сохранения файла:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/main/server-setup.sh | sudo bash
 ```
 
 Появится интерактивное меню. Выбираешь нужные модули или запускаешь всё сразу.
