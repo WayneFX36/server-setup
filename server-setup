@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+
+# ============================================================
+#  SERVER SETUP  v1.0  —  Первоначальная настройка сервера
+#  Поддержка: Ubuntu 20.04/22.04/24.04
+#             Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9
+# ============================================================
+
+set -e
+
+# ─── Конфигурация ────────────────────────────────────────────
+NEW_SSH_PORT=29650
+FAIL2BAN_BANTIME="1h"
+FAIL2BAN_FINDTIME="10m"
+FAIL2BAN_MAXRETRY=3
+
+# ─── Цвета ───────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+log()  { echo -e "${GREEN}[✓]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[✗]${NC} $*"; exit 1; }
+info() { echo -e "${CYAN}[i]${NC} $*"; }
+step() { echo -e "\n${BOLD}${CYAN}══ $* ${NC}"; }
+
+# ─── Определение ОС ──────────────────────────────────────────
+detect_os() {
+  [[ -f /etc/os-release ]] || err "Не удалось определить ОС"
+  . /etc/os-release
+  OS_ID="${ID,,}"
+  OS_VER="${VERSION_ID:-0}"
+  OS_MAJOR="${OS_VER%%.*}"
+  OS_PRETTY="${PRETTY_NAME:-$ID}"
+
+  case "$OS_ID" in
+    ubuntu|debian|linuxmint)
+      FAMILY="debian"
+      ;;
+    rhel|centos|rocky|almalinux|ol|centos-stream)
+      FAMILY="rhel"
+      ;;
+    *)
+      err "Неподдерживаемая ОС: $OS_ID"
+      ;;
+  esac
+
+  info "ОС: $OS_PRETTY  |  Семейство: $FAMILY"
+}
+
+require_root() {
+  [[ $EUID -eq 0 ]] || err "Запусти скрипт от root: sudo bash $0"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  МОДУЛИ
+# ═══════════════════════════════════════════════════════════════
+
+setup_swap() {
+  step "Swap файл (2GB)"
+
+  if [ -f /swapfile ]; then
+    warn "Swap уже существует — пересоздаю..."
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+  fi
+
+  dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+
+  grep -q "/swapfile" /etc/fstab \
+    || echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
+  free -h
+  log "Swap 2GB создан и добавлен в fstab"
+}
+
+setup_dns() {
+  step "Настройка DNS (8.8.8.8 / 1.1.1.1)"
+
+  case "$FAMILY" in
+    debian)
+      cat > /etc/systemd/resolved.conf << 'EOF'
+[Resolve]
+DNS=8.8.8.8 1.1.1.1
+FallbackDNS=8.8.4.4 1.0.0.1
+EOF
+      systemctl restart systemd-resolved
+      systemctl enable systemd-resolved
+      # Симлинк если не настроен
+      if [ ! -L /etc/resolv.conf ]; then
+        rm -f /etc/resolv.conf
+        ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+      fi
+      ;;
+    rhel)
+      # На Rocky resolv.conf может быть защищён NetworkManager — пишем через него
+      if command -v nmcli &>/dev/null; then
+        # Находим активное соединение
+        CONN=$(nmcli -t -f NAME,DEVICE con show --active | head -1 | cut -d: -f1)
+        if [[ -n "$CONN" ]]; then
+          nmcli con mod "$CONN" ipv4.dns "8.8.8.8 1.1.1.1" 2>/dev/null || true
+          nmcli con mod "$CONN" ipv4.ignore-auto-dns yes 2>/dev/null || true
+          nmcli con up "$CONN" 2>/dev/null || true
+          info "DNS настроен через NetworkManager (соединение: $CONN)"
+        fi
+      fi
+      # Дополнительно пишем напрямую — для немедленного эффекта
+      chattr -i /etc/resolv.conf 2>/dev/null || true
+      cat > /etc/resolv.conf << 'EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+      # Защищаем от перезаписи NetworkManager
+      chattr +i /etc/resolv.conf 2>/dev/null || \
+        warn "Не удалось заблокировать resolv.conf от перезаписи — это нормально"
+      ;;
+  esac
+
+  log "DNS настроен"
+}
+
+install_packages() {
+  step "Обновление системы и базовые пакеты"
+
+  case "$FAMILY" in
+    debian)
+      apt-get update -y
+      apt-get upgrade -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        nano vim net-tools htop wget curl ufw cron \
+        socat tar gzip zip unzip logrotate \
+        software-properties-common apt-transport-https \
+        ca-certificates gnupg lsb-release
+      ;;
+    rhel)
+      dnf update -y
+      # EPEL нужен для многих пакетов на Rocky/RHEL
+      dnf install -y epel-release || \
+        dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${OS_MAJOR}.noarch.rpm"
+      dnf install -y \
+        nano vim net-tools htop wget curl crontabs \
+        socat tar gzip zip unzip logrotate \
+        yum-utils ca-certificates
+      ;;
+  esac
+
+  log "Пакеты установлены"
+}
+
+install_docker() {
+  step "Установка Docker"
+
+  case "$FAMILY" in
+    debian)
+      # Удаляем старые версии
+      for pkg in docker.io docker-doc docker-compose docker-compose-v2 \
+                 podman-docker containerd runc; do
+        apt-get remove -y "$pkg" 2>/dev/null || true
+      done
+
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o /usr/share/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+        > /etc/apt/sources.list.d/docker.list
+      apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin
+      ;;
+    rhel)
+      # Удаляем старые версии
+      dnf remove -y docker docker-client docker-client-latest docker-common \
+        docker-latest docker-latest-logrotate docker-logrotate \
+        docker-engine 2>/dev/null || true
+
+      # Добавляем репо Docker для CentOS (совместимо с Rocky/Alma)
+      dnf config-manager --add-repo \
+        https://download.docker.com/linux/centos/docker-ce.repo
+      dnf install -y \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin
+      ;;
+  esac
+
+  systemctl enable --now docker
+  log "Docker $(docker --version | cut -d' ' -f3 | tr -d ',') установлен и запущен"
+}
+
+setup_firewall() {
+  step "Настройка файрвола"
+
+  case "$FAMILY" in
+    debian)
+      # UFW на Ubuntu
+      systemctl stop firewalld 2>/dev/null || true
+      systemctl disable firewalld 2>/dev/null || true
+      apt-get install -y ufw
+
+      ufw --force disable
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow 80/tcp  comment 'HTTP'
+      ufw allow 443/tcp comment 'HTTPS'
+      ufw --force enable
+      ufw status verbose
+      log "UFW настроен (80, 443 открыты)"
+      ;;
+    rhel)
+      # Firewalld на Rocky/RHEL
+      dnf install -y firewalld
+      systemctl enable --now firewalld
+
+      firewall-cmd --permanent --add-port=80/tcp
+      firewall-cmd --permanent --add-port=443/tcp
+      firewall-cmd --permanent --add-service=http
+      firewall-cmd --permanent --add-service=https
+      firewall-cmd --reload
+      log "Firewalld настроен (80, 443 открыты)"
+      ;;
+  esac
+}
+
+setup_ssh_port() {
+  step "Смена порта SSH → ${NEW_SSH_PORT}"
+
+  # Бэкап конфига
+  cp /etc/ssh/sshd_config \
+    "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
+
+  # Меняем или добавляем порт
+  if grep -qE "^#?Port " /etc/ssh/sshd_config; then
+    sed -i -E "s/^#?Port .*/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
+  else
+    echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+  fi
+
+  case "$FAMILY" in
+    debian)
+      ufw allow "${NEW_SSH_PORT}/tcp" comment 'SSH'
+      ufw delete allow 22/tcp 2>/dev/null || true
+      ufw reload
+      ;;
+    rhel)
+      # SELinux: регистрируем новый порт
+      if command -v semanage &>/dev/null; then
+        semanage port -a -t ssh_port_t -p tcp "${NEW_SSH_PORT}" 2>/dev/null \
+          || semanage port -m -t ssh_port_t -p tcp "${NEW_SSH_PORT}" 2>/dev/null \
+          || warn "semanage не сработал — возможно SELinux отключён"
+      else
+        # policycoreutils-python-utils не установлен — пробуем поставить
+        dnf install -y policycoreutils-python-utils 2>/dev/null || true
+        semanage port -a -t ssh_port_t -p tcp "${NEW_SSH_PORT}" 2>/dev/null || true
+      fi
+
+      firewall-cmd --permanent --add-port="${NEW_SSH_PORT}/tcp"
+      firewall-cmd --permanent --remove-service=ssh 2>/dev/null || true
+      firewall-cmd --reload
+      ;;
+  esac
+
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+  log "SSH порт изменён на ${NEW_SSH_PORT}"
+}
+
+setup_fail2ban() {
+  step "Fail2ban"
+
+  case "$FAMILY" in
+    debian)
+      apt-get install -y fail2ban
+
+      # Action через UFW
+      cat > /etc/fail2ban/action.d/ufw.conf << 'EOF'
+[Definition]
+actionban   = ufw insert 1 deny from <ip> to any
+actionunban = ufw delete deny from <ip> to any
+EOF
+
+      BANACTION="ufw"
+      BANACTION_ALL="ufw"
+      ;;
+    rhel)
+      dnf install -y fail2ban fail2ban-firewalld 2>/dev/null \
+        || dnf install -y fail2ban
+
+      # ── БАГ-ФИКС: на Rocky стандартный firewalld action сломан ──
+      # Используем iptables-ipset — он надёжнее и работает без rich rules
+      BANACTION="iptables-ipset-proto6"
+      BANACTION_ALL="iptables-allports"
+
+      # Убеждаемся что iptables доступен
+      dnf install -y iptables 2>/dev/null || true
+      ;;
+  esac
+
+  cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+ignoreip     = 127.0.0.1/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+bantime      = ${FAIL2BAN_BANTIME}
+findtime     = ${FAIL2BAN_FINDTIME}
+maxretry     = ${FAIL2BAN_MAXRETRY}
+banaction    = ${BANACTION}
+banaction_allports = ${BANACTION_ALL}
+
+[sshd]
+enabled  = true
+port     = ${NEW_SSH_PORT}
+backend  = systemd
+logpath  = %(sshd_log)s
+maxretry = 6
+
+[sshd-ddos]
+enabled  = true
+port     = ${NEW_SSH_PORT}
+logpath  = %(sshd_log)s
+maxretry = 3
+findtime = 5m
+bantime  = 2h
+
+[recidive]
+enabled  = true
+logpath  = /var/log/fail2ban.log
+maxretry = 5
+findtime = 1d
+bantime  = 1w
+EOF
+
+  # Logrotate для fail2ban
+  cat > /etc/logrotate.d/fail2ban << 'EOF'
+/var/log/fail2ban.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        systemctl reload fail2ban > /dev/null 2>&1 || true
+    endscript
+}
+EOF
+
+  systemctl enable --now fail2ban
+  sleep 2
+  fail2ban-client status sshd 2>/dev/null || warn "fail2ban sshd jail ещё стартует"
+  log "Fail2ban настроен"
+}
+
+install_micro() {
+  step "Micro редактор"
+
+  if command -v micro &>/dev/null; then
+    info "Micro уже установлен: $(micro --version 2>&1 | head -1)"
+    return
+  fi
+
+  cd /tmp
+  curl -fsSL https://getmic.ro | bash
+  if [[ -f ./micro ]]; then
+    mv ./micro /usr/local/bin/micro
+    chmod +x /usr/local/bin/micro
+    log "Micro установлен: $(micro --version 2>&1 | head -1)"
+  else
+    warn "Micro не скачался — пропускаю"
+  fi
+  cd - > /dev/null
+}
+
+tune_network() {
+  step "Сетевые параметры (BBR + оптимизация)"
+
+  # Пробуем загрузить BBR
+  modprobe tcp_bbr 2>/dev/null || true
+
+  cat > /etc/sysctl.d/99-server-setup.conf << 'EOF'
+# Congestion control
+net.core.default_qdisc          = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Буферы и очереди
+net.core.netdev_max_backlog  = 65536
+net.core.somaxconn           = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
+
+# TCP оптимизации
+net.ipv4.tcp_fastopen        = 3
+net.ipv4.tcp_mtu_probing     = 1
+net.ipv4.tcp_syncookies      = 1
+net.ipv4.tcp_syn_retries     = 2
+net.ipv4.tcp_synack_retries  = 2
+net.ipv4.tcp_fin_timeout     = 15
+net.ipv4.tcp_keepalive_time  = 300
+EOF
+
+  sysctl -p /etc/sysctl.d/99-server-setup.conf >/dev/null 2>&1 || true
+
+  CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  log "Сеть настроена  |  CC: ${BOLD}${CC}${NC}"
+}
+
+setup_ssh_security() {
+  step "SSH безопасность (ключи / пароль)"
+
+  # Проверяем ключи
+  if [[ ! -f /root/.ssh/authorized_keys ]] || [[ ! -s /root/.ssh/authorized_keys ]]; then
+    warn "SSH ключи для root не найдены!"
+    read -p "Добавить SSH ключ сейчас? (y/n): " -n 1 -r; echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      mkdir -p /root/.ssh
+      chmod 700 /root/.ssh
+      echo "Вставьте публичный ключ и нажмите Ctrl+D:"
+      cat >> /root/.ssh/authorized_keys
+      chmod 600 /root/.ssh/authorized_keys
+      log "SSH ключ добавлен"
+    fi
+  fi
+
+  read -p "Отключить вход по паролю SSH? (y/n): " -n 1 -r; echo
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' \
+      /etc/ssh/sshd_config
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    log "Вход по паролю отключён"
+  else
+    info "Вход по паролю оставлен"
+  fi
+}
+
+cleanup() {
+  step "Очистка кеша"
+  case "$FAMILY" in
+    debian) apt-get clean; apt-get autoremove -y ;;
+    rhel)   dnf clean all ;;
+  esac
+  log "Кеш очищен"
+}
+
+print_summary() {
+  LOCAL_IP=$(hostname -I | awk '{print $1}')
+  PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "?")
+
+  echo ""
+  echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+  echo -e "${BOLD}  Настройка завершена!${NC}"
+  echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+  echo ""
+  echo -e "  ${BOLD}Сервисы:${NC}"
+  echo -e "  Docker   → $(systemctl is-active docker 2>/dev/null || echo 'N/A')"
+  case "$FAMILY" in
+    debian) echo -e "  UFW      → $(systemctl is-active ufw 2>/dev/null || echo 'N/A')" ;;
+    rhel)   echo -e "  Firewall → $(systemctl is-active firewalld 2>/dev/null || echo 'N/A')" ;;
+  esac
+  echo -e "  Fail2ban → $(systemctl is-active fail2ban 2>/dev/null || echo 'N/A')"
+  echo -e "  SSH      → $(systemctl is-active sshd 2>/dev/null || systemctl is-active ssh 2>/dev/null || echo 'N/A')"
+  echo ""
+  echo -e "  ${BOLD}Swap:${NC}      $(free -h | awk '/Swap/{print $2}')"
+  echo -e "  ${BOLD}Docker:${NC}    $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')"
+  echo -e "  ${BOLD}TCP CC:${NC}    $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo ""
+  echo -e "  ${BOLD}${RED}ВАЖНО!${NC} Не закрывай сессию — сначала проверь новый SSH порт:"
+  echo -e "  ${BOLD}ssh -p ${NEW_SSH_PORT} root@${PUBLIC_IP}${NC}"
+  echo ""
+  echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+  echo -e "${BOLD}  Полезные команды:${NC}"
+  echo -e "${DIM}  fail2ban-client status sshd${NC}"
+  echo -e "${DIM}  fail2ban-client unban <IP>${NC}"
+  echo -e "${DIM}  tail -f /var/log/fail2ban.log${NC}"
+  case "$FAMILY" in
+    debian) echo -e "${DIM}  ufw status verbose${NC}" ;;
+    rhel)   echo -e "${DIM}  firewall-cmd --list-all${NC}" ;;
+  esac
+  echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+  echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  МЕНЮ
+# ═══════════════════════════════════════════════════════════════
+
+print_banner() {
+  clear
+  echo -e "${BOLD}${CYAN}"
+  cat << 'BANNER'
+  ╔══════════════════════════════════════════════════════╗
+  ║          SERVER SETUP  v1.0                          ║
+  ║    Ubuntu • Rocky Linux • AlmaLinux • RHEL           ║
+  ╚══════════════════════════════════════════════════════╝
+BANNER
+  echo -e "${NC}"
+}
+
+print_menu() {
+  echo -e "${BOLD}  МОДУЛИ${NC}"
+  echo -e "  ${CYAN}[1]${NC}  Swap файл (2GB)"
+  echo -e "  ${CYAN}[2]${NC}  DNS (8.8.8.8 / 1.1.1.1)"
+  echo -e "  ${CYAN}[3]${NC}  Системные пакеты + обновление"
+  echo -e "  ${CYAN}[4]${NC}  Docker"
+  echo -e "  ${CYAN}[5]${NC}  Файрвол ${DIM}(UFW на Ubuntu / Firewalld на Rocky)${NC}"
+  echo -e "  ${CYAN}[6]${NC}  SSH порт → ${NEW_SSH_PORT}"
+  echo -e "  ${CYAN}[7]${NC}  Fail2ban"
+  echo -e "  ${CYAN}[8]${NC}  Micro редактор"
+  echo -e "  ${CYAN}[9]${NC}  Сетевые параметры (BBR + sysctl)"
+  echo -e "  ${CYAN}[10]${NC} SSH ключи / отключение пароля"
+  echo -e "  ${CYAN}[11]${NC} Очистка кеша"
+  echo ""
+  echo -e "${BOLD}  КОМБО${NC}"
+  echo -e "  ${CYAN}[12]${NC} ${BOLD}Полная настройка${NC} ${DIM}(все модули подряд)${NC}"
+  echo ""
+  echo -e "  ${RED}[0]${NC}  Выход"
+  echo ""
+  echo -ne "${BOLD}Выбор:${NC} "
+}
+
+run_choice() {
+  case "$1" in
+    1)  setup_swap ;;
+    2)  setup_dns ;;
+    3)  install_packages ;;
+    4)  install_docker ;;
+    5)  setup_firewall ;;
+    6)  setup_ssh_port ;;
+    7)  setup_fail2ban ;;
+    8)  install_micro ;;
+    9)  tune_network ;;
+    10) setup_ssh_security ;;
+    11) cleanup ;;
+    12)
+      setup_swap
+      setup_dns
+      install_packages
+      install_docker
+      setup_firewall
+      setup_ssh_port
+      setup_fail2ban
+      install_micro
+      tune_network
+      setup_ssh_security
+      cleanup
+      print_summary
+      ;;
+    0)  echo -e "\n${DIM}Пока!${NC}\n"; exit 0 ;;
+    *)  warn "Неверный выбор: $1" ;;
+  esac
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+
+main() {
+  require_root
+  detect_os
+
+  # Неинтерактивный режим
+  if [[ $# -gt 0 ]]; then
+    run_choice "$1"
+    [[ "$1" != "12" ]] && { echo ""; log "Готово!"; }
+    exit 0
+  fi
+
+  while true; do
+    print_banner
+    info "ОС: $OS_PRETTY"
+    echo ""
+    print_menu
+    read -r choice
+    run_choice "$choice"
+    echo ""
+    echo -ne "${DIM}Нажми Enter для возврата в меню...${NC}"
+    read -r
+  done
+}
+
+main "$@"
