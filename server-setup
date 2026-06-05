@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ============================================================
-#  SERVER SETUP  v1.0  —  Первоначальная настройка сервера
+#  SERVER SETUP  v1.1  —  Первоначальная настройка сервера
 #  Поддержка: Ubuntu 20.04/22.04/24.04
 #             Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9
 # ============================================================
@@ -89,16 +89,13 @@ FallbackDNS=8.8.4.4 1.0.0.1
 EOF
       systemctl restart systemd-resolved
       systemctl enable systemd-resolved
-      # Симлинк если не настроен
       if [ ! -L /etc/resolv.conf ]; then
         rm -f /etc/resolv.conf
         ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
       fi
       ;;
     rhel)
-      # На Rocky resolv.conf может быть защищён NetworkManager — пишем через него
       if command -v nmcli &>/dev/null; then
-        # Находим активное соединение
         CONN=$(nmcli -t -f NAME,DEVICE con show --active | head -1 | cut -d: -f1)
         if [[ -n "$CONN" ]]; then
           nmcli con mod "$CONN" ipv4.dns "8.8.8.8 1.1.1.1" 2>/dev/null || true
@@ -107,13 +104,11 @@ EOF
           info "DNS настроен через NetworkManager (соединение: $CONN)"
         fi
       fi
-      # Дополнительно пишем напрямую — для немедленного эффекта
       chattr -i /etc/resolv.conf 2>/dev/null || true
       cat > /etc/resolv.conf << 'EOF'
 nameserver 8.8.8.8
 nameserver 1.1.1.1
 EOF
-      # Защищаем от перезаписи NetworkManager
       chattr +i /etc/resolv.conf 2>/dev/null || \
         warn "Не удалось заблокировать resolv.conf от перезаписи — это нормально"
       ;;
@@ -137,7 +132,6 @@ install_packages() {
       ;;
     rhel)
       dnf update -y
-      # EPEL нужен для многих пакетов на Rocky/RHEL
       dnf install -y epel-release || \
         dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${OS_MAJOR}.noarch.rpm"
       dnf install -y \
@@ -155,7 +149,6 @@ install_docker() {
 
   case "$FAMILY" in
     debian)
-      # Удаляем старые версии
       for pkg in docker.io docker-doc docker-compose docker-compose-v2 \
                  podman-docker containerd runc; do
         apt-get remove -y "$pkg" 2>/dev/null || true
@@ -172,12 +165,10 @@ https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
         docker-buildx-plugin docker-compose-plugin
       ;;
     rhel)
-      # Удаляем старые версии
       dnf remove -y docker docker-client docker-client-latest docker-common \
         docker-latest docker-latest-logrotate docker-logrotate \
         docker-engine 2>/dev/null || true
 
-      # Добавляем репо Docker для CentOS (совместимо с Rocky/Alma)
       dnf config-manager --add-repo \
         https://download.docker.com/linux/centos/docker-ce.repo
       dnf install -y \
@@ -195,7 +186,6 @@ setup_firewall() {
 
   case "$FAMILY" in
     debian)
-      # UFW на Ubuntu
       systemctl stop firewalld 2>/dev/null || true
       systemctl disable firewalld 2>/dev/null || true
       apt-get install -y ufw
@@ -210,7 +200,6 @@ setup_firewall() {
       log "UFW настроен (80, 443 открыты)"
       ;;
     rhel)
-      # Firewalld на Rocky/RHEL
       dnf install -y firewalld
       systemctl enable --now firewalld
 
@@ -227,11 +216,9 @@ setup_firewall() {
 setup_ssh_port() {
   step "Смена порта SSH → ${NEW_SSH_PORT}"
 
-  # Бэкап конфига
   cp /etc/ssh/sshd_config \
     "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
 
-  # Меняем или добавляем порт
   if grep -qE "^#?Port " /etc/ssh/sshd_config; then
     sed -i -E "s/^#?Port .*/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
   else
@@ -245,13 +232,11 @@ setup_ssh_port() {
       ufw reload
       ;;
     rhel)
-      # SELinux: регистрируем новый порт
       if command -v semanage &>/dev/null; then
         semanage port -a -t ssh_port_t -p tcp "${NEW_SSH_PORT}" 2>/dev/null \
           || semanage port -m -t ssh_port_t -p tcp "${NEW_SSH_PORT}" 2>/dev/null \
           || warn "semanage не сработал — возможно SELinux отключён"
       else
-        # policycoreutils-python-utils не установлен — пробуем поставить
         dnf install -y policycoreutils-python-utils 2>/dev/null || true
         semanage port -a -t ssh_port_t -p tcp "${NEW_SSH_PORT}" 2>/dev/null || true
       fi
@@ -273,7 +258,6 @@ setup_fail2ban() {
     debian)
       apt-get install -y fail2ban
 
-      # Action через UFW
       cat > /etc/fail2ban/action.d/ufw.conf << 'EOF'
 [Definition]
 actionban   = ufw insert 1 deny from <ip> to any
@@ -287,12 +271,9 @@ EOF
       dnf install -y fail2ban fail2ban-firewalld 2>/dev/null \
         || dnf install -y fail2ban
 
-      # ── БАГ-ФИКС: на Rocky стандартный firewalld action сломан ──
-      # Используем iptables-ipset — он надёжнее и работает без rich rules
       BANACTION="iptables-ipset-proto6"
       BANACTION_ALL="iptables-allports"
 
-      # Убеждаемся что iptables доступен
       dnf install -y iptables 2>/dev/null || true
       ;;
   esac
@@ -329,7 +310,6 @@ findtime = 1d
 bantime  = 1w
 EOF
 
-  # Logrotate для fail2ban
   cat > /etc/logrotate.d/fail2ban << 'EOF'
 /var/log/fail2ban.log {
     weekly
@@ -373,7 +353,6 @@ install_micro() {
 tune_network() {
   step "Сетевые параметры (BBR + оптимизация)"
 
-  # Пробуем загрузить BBR
   modprobe tcp_bbr 2>/dev/null || true
 
   cat > /etc/sysctl.d/99-server-setup.conf << 'EOF'
@@ -405,7 +384,6 @@ EOF
 setup_ssh_security() {
   step "SSH безопасность (ключи / пароль)"
 
-  # Проверяем ключи
   if [[ ! -f /root/.ssh/authorized_keys ]] || [[ ! -s /root/.ssh/authorized_keys ]]; then
     warn "SSH ключи для root не найдены!"
     read -p "Добавить SSH ключ сейчас? (y/n): " -n 1 -r; echo
@@ -428,6 +406,54 @@ setup_ssh_security() {
   else
     info "Вход по паролю оставлен"
   fi
+}
+
+# ─── НОВЫЙ МОДУЛЬ: Logrotate для RemnaNode ───────────────────
+setup_logrotate_remnanode() {
+  step "Logrotate — RemnaNode"
+
+  # Устанавливаем logrotate если не установлен
+  if ! command -v logrotate &>/dev/null; then
+    info "logrotate не найден — устанавливаю..."
+    case "$FAMILY" in
+      debian) apt-get install -y logrotate ;;
+      rhel)   dnf install -y logrotate ;;
+    esac
+  else
+    info "logrotate уже установлен: $(logrotate --version 2>&1 | head -1)"
+  fi
+
+  # Создаём директорию для логов если отсутствует
+  mkdir -p /var/log/remnanode
+
+  # Пишем конфиг
+  cat > /etc/logrotate.d/remnanode << 'EOF'
+/var/log/remnanode/*.log {
+    size 50M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+  log "Конфиг записан: /etc/logrotate.d/remnanode"
+
+  # Тест конфига
+  info "Проверка конфигурации logrotate..."
+  if logrotate -vf /etc/logrotate.d/remnanode 2>&1 | grep -qE "rotating|considering|no log files"; then
+    log "Тест logrotate прошёл успешно"
+  else
+    # Запускаем ещё раз для вывода результата пользователю
+    logrotate -vf /etc/logrotate.d/remnanode 2>&1 | tail -5 || true
+    warn "Логов пока нет в /var/log/remnanode/ — это нормально при первом запуске"
+  fi
+
+  log "Logrotate для RemnaNode настроен"
+  info "Конфиг:       /etc/logrotate.d/remnanode"
+  info "Директория:   /var/log/remnanode/"
+  info "Политика:     rotate 5 × 50MB, compress, copytruncate"
 }
 
 cleanup() {
@@ -460,6 +486,7 @@ print_summary() {
   echo -e "  ${BOLD}Swap:${NC}      $(free -h | awk '/Swap/{print $2}')"
   echo -e "  ${BOLD}Docker:${NC}    $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')"
   echo -e "  ${BOLD}TCP CC:${NC}    $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo -e "  ${BOLD}Logrotate:${NC} $(logrotate --version 2>/dev/null | head -1 | awk '{print $2}')"
   echo ""
   echo -e "  ${BOLD}${RED}ВАЖНО!${NC} Не закрывай сессию — сначала проверь новый SSH порт:"
   echo -e "  ${BOLD}ssh -p ${NEW_SSH_PORT} root@${PUBLIC_IP}${NC}"
@@ -473,6 +500,8 @@ print_summary() {
     debian) echo -e "${DIM}  ufw status verbose${NC}" ;;
     rhel)   echo -e "${DIM}  firewall-cmd --list-all${NC}" ;;
   esac
+  echo -e "${DIM}  logrotate -vf /etc/logrotate.d/remnanode${NC}"
+  echo -e "${DIM}  ls -lh /var/log/remnanode/${NC}"
   echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
   echo ""
 }
@@ -486,7 +515,7 @@ print_banner() {
   echo -e "${BOLD}${CYAN}"
   cat << 'BANNER'
   ╔══════════════════════════════════════════════════════╗
-  ║          SERVER SETUP  v1.0                          ║
+  ║          SERVER SETUP  v1.1                          ║
   ║    Ubuntu • Rocky Linux • AlmaLinux • RHEL           ║
   ╚══════════════════════════════════════════════════════╝
 BANNER
@@ -506,9 +535,10 @@ print_menu() {
   echo -e "  ${CYAN}[9]${NC}  Сетевые параметры (BBR + sysctl)"
   echo -e "  ${CYAN}[10]${NC} SSH ключи / отключение пароля"
   echo -e "  ${CYAN}[11]${NC} Очистка кеша"
+  echo -e "  ${CYAN}[12]${NC} ${BOLD}Logrotate — RemnaNode${NC}"
   echo ""
   echo -e "${BOLD}  КОМБО${NC}"
-  echo -e "  ${CYAN}[12]${NC} ${BOLD}Полная настройка${NC} ${DIM}(все модули подряд)${NC}"
+  echo -e "  ${CYAN}[13]${NC} ${BOLD}Полная настройка${NC} ${DIM}(все модули подряд)${NC}"
   echo ""
   echo -e "  ${RED}[0]${NC}  Выход"
   echo ""
@@ -528,7 +558,8 @@ run_choice() {
     9)  tune_network ;;
     10) setup_ssh_security ;;
     11) cleanup ;;
-    12)
+    12) setup_logrotate_remnanode ;;
+    13)
       setup_swap
       setup_dns
       install_packages
@@ -539,6 +570,7 @@ run_choice() {
       install_micro
       tune_network
       setup_ssh_security
+      setup_logrotate_remnanode
       cleanup
       print_summary
       ;;
@@ -555,10 +587,9 @@ main() {
   require_root
   detect_os
 
-  # Неинтерактивный режим
   if [[ $# -gt 0 ]]; then
     run_choice "$1"
-    [[ "$1" != "12" ]] && { echo ""; log "Готово!"; }
+    [[ "$1" != "13" ]] && { echo ""; log "Готово!"; }
     exit 0
   fi
 
