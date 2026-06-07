@@ -480,9 +480,9 @@ install_selfsni() {
       ;;
     rhel)
       if systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --add-service=http
-        firewall-cmd --permanent --add-service=https
-        firewall-cmd --reload
+        firewall-cmd --permanent --add-service=http 2>/dev/null | grep -v "ALREADY_ENABLED" || true
+        firewall-cmd --permanent --add-service=https 2>/dev/null | grep -v "ALREADY_ENABLED" || true
+        firewall-cmd --reload > /dev/null 2>&1
       fi
       ;;
   esac
