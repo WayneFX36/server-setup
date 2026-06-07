@@ -578,6 +578,115 @@ EOF
   systemctl enable nginx > /dev/null 2>&1
   nginx -t > /dev/null 2>&1 && systemctl start nginx
 
+  # Генерация конфига Xray
+  step "Генерация конфига Xray Reality"
+
+  # Генерируем ключи через openssl (x25519)
+  local private_key public_key
+  if command -v xray &>/dev/null; then
+    local keypair
+    keypair=$(xray x25519 2>/dev/null)
+    private_key=$(echo "$keypair" | grep "Private" | awk '{print $3}')
+    public_key=$(echo "$keypair" | grep "Public" | awk '{print $3}')
+  else
+    # Генерация через openssl если xray недоступен
+    local raw_key
+    raw_key=$(openssl genpkey -algorithm X25519 2>/dev/null)
+    private_key=$(echo "$raw_key" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+    public_key=$(echo "$raw_key" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+  fi
+
+  # Генерируем shortIds
+  local short_ids=()
+  for i in {1..5}; do
+    short_ids+=("$(openssl rand -hex 4)")
+  done
+
+  # Тег из домена (первая часть до точки)
+  local tag
+  tag=$(echo "$SNI_DOMAIN" | cut -d. -f1 | tr '[:upper:]' '[:lower:]')-tcp
+
+  # Путь для сохранения конфига
+  local conf_path="/root/xray-config-${SNI_DOMAIN}.json"
+
+  cat > "$conf_path" << EOF
+{
+  "log": {
+    "error": "/var/log/remnanode/error.log",
+    "access": "/var/log/remnanode/access.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "${tag}",
+      "port": 443,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "target": "127.0.0.1:${SNI_PORT}",
+          "shortIds": [
+            "${short_ids[0]}",
+            "${short_ids[1]}",
+            "${short_ids[2]}",
+            "${short_ids[3]}",
+            "${short_ids[4]}"
+          ],
+          "privateKey": "${private_key}",
+          "serverNames": [
+            "${SNI_DOMAIN}",
+            "www.${SNI_DOMAIN}"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "ip": [
+          "geoip:private"
+        ],
+        "type": "field",
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-ads-all"
+        ],
+        "outboundTag": "block"
+      }
+    ],
+    "domainStrategy": "AsIs"
+  }
+}
+EOF
+
   echo ""
   log "Self SNI установлен!"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
@@ -585,6 +694,13 @@ EOF
   echo -e "  ${YELLOW}Ключ:${NC}       /etc/letsencrypt/live/${SNI_DOMAIN}/privkey.pem"
   echo -e "  ${YELLOW}Dest:${NC}       127.0.0.1:${SNI_PORT}"
   echo -e "  ${YELLOW}SNI:${NC}        ${SNI_DOMAIN}"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo ""
+  log "Конфиг Xray сохранён: ${conf_path}"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${YELLOW}Private Key:${NC} ${private_key}"
+  echo -e "  ${YELLOW}Public Key:${NC}  ${public_key}"
+  echo -e "  ${YELLOW}Short IDs:${NC}   ${short_ids[*]}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
 }
 
