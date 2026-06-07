@@ -1,17 +1,17 @@
 <div align="center">
 
-```
-╔══════════════════════════════════════════════════════╗
-║          SERVER SETUP  v1.0                          ║
-║     Первоначальная настройка сервера за минуты       ║
-╚══════════════════════════════════════════════════════╝
-```
+<img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=700&size=28&pause=1000&color=00D9FF&center=true&vCenter=true&width=600&lines=SERVER+SETUP+v1.3;Ubuntu+%E2%80%A2+Rocky+%E2%80%A2+AlmaLinux+%E2%80%A2+RHEL" alt="Typing SVG" />
 
-**Swap, DNS, Docker, файрвол, SSH, Fail2ban — одним скриптом.**
+<br/>
+
+**Swap · DNS · Docker · Firewall · SSH · Fail2ban · Self SNI · Remnanode**
+
+<br/>
 
 [![Bash](https://img.shields.io/badge/bash-5.0+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![OS](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Rocky%20%7C%20RHEL-orange?style=flat-square&logo=linux&logoColor=white)](https://github.com)
+[![Version](https://img.shields.io/badge/version-1.3-00D9FF?style=flat-square)](https://github.com)
 
 </div>
 
@@ -25,80 +25,131 @@
 
 ---
 
-## Возможности
-
-| Модуль | Ubuntu/Debian | Rocky/RHEL |
-|---|---|---|
-| **Swap** | `dd` + fstab | `dd` + fstab |
-| **DNS** | systemd-resolved | NetworkManager + resolv.conf |
-| **Пакеты** | apt + стандартные утилиты | dnf + EPEL |
-| **Docker** | официальный репо Ubuntu | официальный репо CentOS |
-| **Файрвол** | UFW | Firewalld |
-| **SSH порт** | ufw allow | semanage + firewall-cmd |
-| **Fail2ban** | action через UFW | action через iptables-ipset |
-| **Сеть** | BBR + sysctl | BBR + sysctl |
-| **Micro** | curl install | curl install |
-
-### 🐛 Что пофикшено для Rocky Linux
-
-- **DNS**: правильная настройка через NetworkManager вместо прямой записи в `resolv.conf` (который перезаписывается при перезагрузке)
-- **SSH порт**: добавлен `semanage port` для регистрации порта в SELinux — без этого sshd не стартует на нестандартном порту
-- **Fail2ban**: заменён сломанный `firewalld` action на `iptables-ipset-proto6` — rich rules в старых версиях fail2ban-firewalld работают нестабильно
-- **SSH конфиг**: исправлен regex для смены порта — корректно обрабатывает все варианты (`#Port 22`, `Port 22`, отсутствие строки)
-
----
-
 ## Быстрый старт
 
-**curl:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/refs/heads/main/server-setup -o server-setup.sh
+curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/refs/heads/main/server-setup.sh -o server-setup.sh
 chmod +x server-setup.sh
 sudo bash server-setup.sh
-```
-
-**wget:**
-```bash
-wget -q https://raw.githubusercontent.com/WayneFX36/server-setup/refs/heads/main/server-setup -O server-setup.sh
-chmod +x server-setup.sh
-sudo bash server-setup.sh
-```
-
-**Или сразу запустить без сохранения файла:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/refs/heads/main/server-setup | sudo bash
-```
-
-Появится интерактивное меню. Выбираешь нужные модули или запускаешь всё сразу.
-
-**Без меню:**
-
-```bash
-sudo bash server-setup.sh 12   # полная настройка (все модули)
-sudo bash server-setup.sh 4    # только Docker
-sudo bash server-setup.sh 7    # только Fail2ban
 ```
 
 ---
 
-## Меню
+## Структура меню
 
 ```
-  МОДУЛИ
+┌─────────────────────────────────────────────────────┐
+│                   ГЛАВНОЕ МЕНЮ                      │
+├─────────────────────────────────────────────────────┤
+│  [1]  Установка компонентов                         │
+│       Базовая настройка: swap, dns, docker...       │
+│                                                     │
+│  [2]  Полная установка                              │
+│       Сервер + Self SNI + Remnanode                 │
+└─────────────────────────────────────────────────────┘
+```
+
+### [1] Установка компонентов
+
+```
   [1]   Swap файл (2GB)
   [2]   DNS (8.8.8.8 / 1.1.1.1)
   [3]   Системные пакеты + обновление
   [4]   Docker
-  [5]   Файрвол (UFW на Ubuntu / Firewalld на Rocky)
+  [5]   Файрвол (UFW / Firewalld)
   [6]   SSH порт → 29650
   [7]   Fail2ban
   [8]   Micro редактор
   [9]   Сетевые параметры (BBR + sysctl)
   [10]  SSH ключи / отключение пароля
-
-  КОМБО
-  [12]  Полная настройка (все модули подряд)
+  [11]  Очистка кеша
+  [12]  Logrotate — RemnaNode
+  [13]  Self SNI
+  [14]  Remnanode
+  ──────────────────────────────────────
+  [15]  Установить всё (1–12, без SNI и ноды)
 ```
+
+### [2] Полная установка
+
+Запускает всё в правильном порядке:
+
+```
+  Шаг 1 / 3  →  Базовая настройка сервера (модули 1–12)
+  Шаг 2 / 3  →  Self SNI  ⚠️ устанавливается ДО ноды
+  Шаг 3 / 3  →  Remnanode
+```
+
+> **Важно:** Self SNI устанавливается до запуска Remnanode — после старта ноды порт 80/443 может быть занят, что помешает получить SSL-сертификат.
+
+---
+
+## Возможности
+
+| Модуль | Ubuntu / Debian | Rocky / RHEL |
+|---|---|---|
+| **Swap** | `dd` + fstab | `dd` + fstab |
+| **DNS** | systemd-resolved | NetworkManager + resolv.conf |
+| **Пакеты** | apt + утилиты | dnf + EPEL |
+| **Docker** | официальный репо Ubuntu | официальный репо CentOS |
+| **Файрвол** | UFW | Firewalld |
+| **SSH порт** | `ufw allow` | `semanage` + `firewall-cmd` |
+| **Fail2ban** | action через UFW | action через iptables-ipset |
+| **BBR** | sysctl | sysctl |
+| **Self SNI** | nginx + certbot | nginx + certbot |
+| **Remnanode** | docker compose | docker compose |
+
+---
+
+## Self SNI
+
+Поднимает легитимный веб-сайт с валидным SSL-сертификатом на твоём домене и использует его как `target` в Xray Reality вместо стороннего домена.
+
+```
+Клиент → 443 (Xray/Reality) → 127.0.0.1:9000 (nginx) → сайт
+```
+
+**Шаблоны сайта на выбор:**
+- Бизнес / Корпоративный
+- Портфолио / Агентство
+- Технологии / SaaS
+- Блог / Медиа
+- Личный сайт
+- Случайный из коллекции
+
+**Параметры для Xray после установки:**
+```json
+"realitySettings": {
+    "target": "127.0.0.1:9000",
+    "serverNames": ["your.domain.com"]
+}
+```
+
+---
+
+## Remnanode
+
+Устанавливает [Remnawave Node](https://github.com/remnawave) через Docker Compose. Скрипт запрашивает порт и Secret Key, создаёт `docker-compose.yml` и открывает порт в файрволе.
+
+```yaml
+services:
+  remnanode:
+    image: remnawave/node:latest
+    network_mode: host
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY=your_key
+```
+
+---
+
+## Fail2ban: что настраивается
+
+| Jail | Порог | Бан |
+|---|---|---|
+| `sshd` | 6 попыток | 1 час |
+| `sshd-ddos` | 3 попытки за 5 мин | 2 часа |
+| `recidive` | 5 банов за сутки | 1 неделя |
 
 ---
 
@@ -112,16 +163,6 @@ FAIL2BAN_BANTIME="1h"     # время бана
 FAIL2BAN_FINDTIME="10m"   # окно для подсчёта попыток
 FAIL2BAN_MAXRETRY=3       # макс. попыток до бана
 ```
-
----
-
-## Fail2ban: что настраивается
-
-| Jail | Порог | Бан |
-|---|---|---|
-| `sshd` | 6 попыток | по умолчанию (1h) |
-| `sshd-ddos` | 3 попытки за 5 мин | 2 часа |
-| `recidive` | 5 банов за сутки | 1 неделя |
 
 ---
 
@@ -139,28 +180,35 @@ FAIL2BAN_MAXRETRY=3       # макс. попыток до бана
 
 ## Важные замечания
 
-- **SSH порт**: не закрывай текущую сессию, пока не проверишь подключение на новом порту
-- **Rocky + SELinux**: скрипт автоматически регистрирует новый SSH порт через `semanage`
-- **Rocky + DNS**: `resolv.conf` защищается от перезаписи через `chattr +i` как запасной вариант
-- Все sysctl сохраняются в `/etc/sysctl.d/99-server-setup.conf`
+- **SSH порт** — не закрывай сессию, пока не проверишь подключение на новом порту
+- **Rocky + SELinux** — скрипт автоматически регистрирует SSH порт через `semanage`
+- **Rocky + DNS** — `resolv.conf` защищается от перезаписи через `chattr +i`
+- **Self SNI** — домен должен иметь A-запись, указывающую на IP сервера, до запуска скрипта
+- **Порядок** — Self SNI всегда устанавливается до Remnanode
 
 ---
 
-## Полезные команды после установки
+## Полезные команды
 
 ```bash
-# Статус и управление Fail2ban
+# Fail2ban
 fail2ban-client status sshd
 fail2ban-client unban <IP>
 tail -f /var/log/fail2ban.log
 
 # Файрвол
-ufw status verbose                  # Ubuntu
-firewall-cmd --list-all             # Rocky
+ufw status verbose          # Ubuntu
+firewall-cmd --list-all     # Rocky
 
-# Docker
+# Docker / Remnanode
 docker ps
-docker compose up -d
+docker logs remnanode -f
+cd /opt/remnanode && docker compose restart
+
+# Nginx / Self SNI
+nginx -t
+systemctl reload nginx
+certbot renew --dry-run
 ```
 
 ---
