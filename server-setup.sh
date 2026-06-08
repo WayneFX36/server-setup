@@ -461,10 +461,18 @@ install_selfsni() {
 
   # Проверка DNS
   info "Проверка A-записи домена..."
-  external_ip=$(curl -s --max-time 5 https://api.ipify.org)
   domain_ip=$(dig +short A "$SNI_DOMAIN" | head -n1)
   [[ -z "$domain_ip" ]] && err "Не удалось получить A-запись для $SNI_DOMAIN"
-  [[ "$domain_ip" != "$external_ip" ]] && err "A-запись $SNI_DOMAIN ($domain_ip) не совпадает с IP сервера ($external_ip)"
+
+  # Получаем все IP адреса сервера
+  all_server_ips=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.')
+  # Также проверяем через внешний сервис
+  external_ip=$(curl -s --max-time 5 https://api.ipify.org)
+  [[ -n "$external_ip" ]] && all_server_ips=$(echo -e "$all_server_ips\n$external_ip")
+
+  if ! echo "$all_server_ips" | grep -qx "$domain_ip"; then
+    err "A-запись $SNI_DOMAIN ($domain_ip) не совпадает ни с одним IP сервера"
+  fi
   log "DNS корректен: $SNI_DOMAIN → $domain_ip"
 
   # Остановка nginx и проверка портов
