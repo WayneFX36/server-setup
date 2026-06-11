@@ -258,6 +258,21 @@ setup_ssh_port() {
       ufw allow "${NEW_SSH_PORT}/tcp" comment 'SSH'
       ufw delete allow 22/tcp 2>/dev/null || true
       ufw reload
+
+      # Ubuntu 22.04+ использует ssh.socket — нужно обновить и его
+      if systemctl list-units --type=socket 2>/dev/null | grep -q "ssh.socket"; then
+        mkdir -p /etc/systemd/system/ssh.socket.d
+        cat > /etc/systemd/system/ssh.socket.d/override.conf << EOF
+[Socket]
+ListenStream=
+ListenStream=${NEW_SSH_PORT}
+EOF
+        systemctl daemon-reload
+        systemctl restart ssh.socket
+        log "ssh.socket обновлён на порт ${NEW_SSH_PORT}"
+      else
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+      fi
       ;;
     rhel)
       if command -v semanage &>/dev/null; then
@@ -271,9 +286,9 @@ setup_ssh_port() {
       firewall-cmd --permanent --add-port="${NEW_SSH_PORT}/tcp"
       firewall-cmd --permanent --remove-service=ssh 2>/dev/null || true
       firewall-cmd --reload
+      systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
       ;;
   esac
-  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
   log "SSH порт изменён на ${NEW_SSH_PORT}"
 }
 
