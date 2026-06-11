@@ -141,13 +141,19 @@ install_packages() {
   step "Обновление системы и базовые пакеты"
   case "$FAMILY" in
     debian)
-      apt-get update -y
-      apt-get upgrade -y
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
       DEBIAN_FRONTEND=noninteractive apt-get install -y \
         nano vim net-tools htop wget curl ufw cron \
         socat tar gzip zip unzip logrotate \
         software-properties-common apt-transport-https \
-        ca-certificates gnupg lsb-release
+        ca-certificates gnupg lsb-release \
+        dnsutils bind9-dnsutils 2>/dev/null || \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        nano vim net-tools htop wget curl ufw cron \
+        socat tar gzip zip unzip logrotate \
+        software-properties-common apt-transport-https \
+        ca-certificates gnupg lsb-release dnsutils
       ;;
     rhel)
       dnf update -y
@@ -172,12 +178,21 @@ install_docker() {
     debian)
       for pkg in docker.io docker-doc docker-compose docker-compose-v2 \
                  podman-docker containerd runc; do
-        apt-get remove -y "$pkg" 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y "$pkg" 2>/dev/null || true
       done
-      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        | gpg --dearmor -o /usr/share/keyrings/docker.gpg
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      # Универсальный путь для Ubuntu и Debian
+      install -m 0755 -d /etc/apt/keyrings
+      # Определяем дистрибутив и правильный репо
+      if [[ "$OS_ID" == "ubuntu" ]]; then
+        local DOCKER_REPO_URL="https://download.docker.com/linux/ubuntu"
+      else
+        local DOCKER_REPO_URL="https://download.docker.com/linux/debian"
+      fi
+      curl -fsSL "${DOCKER_REPO_URL}/gpg" \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+${DOCKER_REPO_URL} $(lsb_release -cs) stable" \
         > /etc/apt/sources.list.d/docker.list
       apt-get update -y
       DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -486,12 +501,26 @@ install_selfsni() {
   # Зависимости для SNI
   case "$FAMILY" in
     debian)
-      apt-get install -y nginx certbot python3-certbot-nginx git curl dnsutils
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        nginx certbot python3-certbot-nginx git curl \
+        dnsutils bind9-dnsutils 2>/dev/null || \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        nginx certbot python3-certbot-nginx git curl dnsutils
+      # Ubuntu/Debian: webroot в /var/www/html
+      NGINX_WEBROOT_BASE="/var/www/html"
       ;;
     rhel)
       dnf install -y epel-release 2>/dev/null || true
       dnf install -y nginx certbot python3-certbot-nginx git curl bind-utils
+      # Rocky/RHEL: webroot в /usr/share/nginx/html
+      NGINX_WEBROOT_BASE="/usr/share/nginx/html"
       ;;
+  esac
+
+  # Пересчитываем WEBROOT с правильным base
+  case $TMPL in
+    1|2|3|4|5) WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
+    *)          WEBROOT="${NGINX_WEBROOT_BASE}" ;;
   esac
 
   read -p "Введите доменное имя для SNI: " SNI_DOMAIN
@@ -559,11 +588,12 @@ install_selfsni() {
   # Шаблон сайта
   TEMP_DIR=$(mktemp -d)
   if run_with_spinner "git clone --depth 1 $TMPL_URL $TEMP_DIR" "Загрузка шаблона..."; then
+    mkdir -p "$NGINX_WEBROOT_BASE"
     if [[ "$TMPL" == "6" ]]; then
       SITE_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | shuf -n 1)
-      cp -r "$SITE_DIR"/* /usr/share/nginx/html/ 2>/dev/null
+      cp -r "$SITE_DIR"/* "$NGINX_WEBROOT_BASE"/ 2>/dev/null
     else
-      cp -r "$TEMP_DIR"/* /usr/share/nginx/html/ 2>/dev/null
+      cp -r "$TEMP_DIR"/* "$NGINX_WEBROOT_BASE"/ 2>/dev/null
     fi
     log "Шаблон установлен"
   else
@@ -606,10 +636,10 @@ EOF
   rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-  NGINX_CONF_DIR="/etc/nginx/conf.d"
-  [[ "$FAMILY" == "debian" ]] && NGINX_CONF_DIR="/etc/nginx/sites-enabled"
-
-  cat > "${NGINX_CONF_DIR}/sni.conf" << EOF
+  if [[ "$FAMILY" == "debian" ]]; then
+    # Ubuntu/Debian: sites-available + симлинк
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    cat > "/etc/nginx/sites-available/sni.conf" << EOF
 server {
     listen 80;
     server_name ${SNI_DOMAIN};
@@ -640,9 +670,42 @@ server {
     }
 }
 EOF
+    ln -sf /etc/nginx/sites-available/sni.conf /etc/nginx/sites-enabled/sni.conf
+  else
+    # Rocky/RHEL: conf.d
+    cat > "/etc/nginx/conf.d/sni.conf" << EOF
+server {
+    listen 80;
+    server_name ${SNI_DOMAIN};
+    if (\$host = ${SNI_DOMAIN}) {
+        return 301 https://\$host\$request_uri;
+    }
+    return 404;
+}
 
-  [[ "$FAMILY" == "rhel" ]] && \
+server {
+    listen 127.0.0.1:${SNI_PORT} ssl http2;
+    server_name ${SNI_DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${SNI_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SNI_DOMAIN}/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384";
+
+    real_ip_header proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+
+    location / {
+        root ${WEBROOT};
+        try_files \$uri \$uri/ /index.html;
+        index index.html;
+    }
+}
+EOF
     run_with_spinner "setsebool -P httpd_can_network_connect 1" "Настройка SELinux..." || true
+  fi
 
   systemctl enable nginx > /dev/null 2>&1
   nginx -t > /dev/null 2>&1 && systemctl start nginx
