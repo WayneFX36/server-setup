@@ -75,8 +75,14 @@ require_root() {
 
 setup_swap() {
   step "Swap файл (2GB)"
-  if [ -f /swapfile ]; then
-    warn "Swap уже существует — пересоздаю..."
+  if [ -f /swapfile ] && swapon --show | grep -q /swapfile; then
+    local size
+    size=$(swapon --show --bytes | grep /swapfile | awk '{print $3}')
+    if [[ "$size" -ge 2000000000 ]]; then
+      log "Swap уже настроен ($(free -h | awk '/Swap/{print $2}')) — пропускаю"
+      return
+    fi
+    warn "Swap существует но меньше 2GB — пересоздаю..."
     swapoff /swapfile 2>/dev/null || true
     rm -f /swapfile
   fi
@@ -92,6 +98,10 @@ setup_swap() {
 
 setup_dns() {
   step "Настройка DNS (8.8.8.8 / 1.1.1.1)"
+  if grep -q "8.8.8.8" /etc/resolv.conf 2>/dev/null && grep -q "1.1.1.1" /etc/resolv.conf 2>/dev/null; then
+    log "DNS уже настроен (8.8.8.8 / 1.1.1.1) — пропускаю"
+    return
+  fi
   case "$FAMILY" in
     debian)
       cat > /etc/systemd/resolved.conf << 'EOF'
@@ -154,6 +164,10 @@ install_packages() {
 
 install_docker() {
   step "Установка Docker"
+  if command -v docker &>/dev/null && systemctl is-active --quiet docker; then
+    log "Docker уже установлен и запущен: $(docker --version | cut -d' ' -f3 | tr -d ',') — пропускаю"
+    return
+  fi
   case "$FAMILY" in
     debian)
       for pkg in docker.io docker-doc docker-compose docker-compose-v2 \
@@ -189,6 +203,10 @@ setup_firewall() {
   step "Настройка файрвола"
   case "$FAMILY" in
     debian)
+      if systemctl is-active --quiet ufw && ufw status | grep -q "80/tcp\|443/tcp"; then
+        log "UFW уже настроен — пропускаю"
+        return
+      fi
       systemctl stop firewalld 2>/dev/null || true
       systemctl disable firewalld 2>/dev/null || true
       apt-get install -y ufw
@@ -202,6 +220,12 @@ setup_firewall() {
       log "UFW настроен (80, 443 открыты)"
       ;;
     rhel)
+      if systemctl is-active --quiet firewalld && \
+         firewall-cmd --list-services 2>/dev/null | grep -q "http" && \
+         firewall-cmd --list-services 2>/dev/null | grep -q "https"; then
+        log "Firewalld уже настроен — пропускаю"
+        return
+      fi
       dnf install -y firewalld
       systemctl enable --now firewalld
       firewall-cmd --permanent --add-port=80/tcp
@@ -216,6 +240,12 @@ setup_firewall() {
 
 setup_ssh_port() {
   step "Смена порта SSH → ${NEW_SSH_PORT}"
+  local current_port
+  current_port=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+  if [[ "$current_port" == "$NEW_SSH_PORT" ]]; then
+    log "SSH уже слушает на порту ${NEW_SSH_PORT} — пропускаю"
+    return
+  fi
   cp /etc/ssh/sshd_config \
     "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
   if grep -qE "^#?Port " /etc/ssh/sshd_config; then
@@ -249,6 +279,10 @@ setup_ssh_port() {
 
 setup_fail2ban() {
   step "Fail2ban"
+  if systemctl is-active --quiet fail2ban && [[ -f /etc/fail2ban/jail.local ]]; then
+    log "Fail2ban уже установлен и запущен — пропускаю"
+    return
+  fi
   case "$FAMILY" in
     debian)
       apt-get install -y fail2ban
@@ -337,7 +371,13 @@ install_micro() {
 }
 
 tune_network() {
-  step "Сетевые параметры (BBR + оптимизация)"
+  step "Сетевые параметры (BBR + оптимизация + отключение IPv6)"
+  if [[ -f /etc/sysctl.d/99-server-setup.conf ]] && \
+     grep -q "tcp_bbr" /etc/sysctl.d/99-server-setup.conf && \
+     grep -q "disable_ipv6" /etc/sysctl.d/99-server-setup.conf; then
+    log "Сетевые параметры уже настроены — пропускаю"
+    return
+  fi
   modprobe tcp_bbr 2>/dev/null || true
   cat > /etc/sysctl.d/99-server-setup.conf << 'EOF'
 net.core.default_qdisc          = fq
@@ -352,10 +392,12 @@ net.ipv4.tcp_syn_retries     = 2
 net.ipv4.tcp_synack_retries  = 2
 net.ipv4.tcp_fin_timeout     = 15
 net.ipv4.tcp_keepalive_time  = 300
+net.ipv6.conf.all.disable_ipv6     = 1
+net.ipv6.conf.default.disable_ipv6 = 1
 EOF
   sysctl -p /etc/sysctl.d/99-server-setup.conf >/dev/null 2>&1 || true
   CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
-  log "Сеть настроена  |  CC: ${BOLD}${CC}${NC}"
+  log "Сеть настроена  |  CC: ${BOLD}${CC}${NC}  |  IPv6: отключён"
 }
 
 setup_ssh_security() {
@@ -385,6 +427,10 @@ setup_ssh_security() {
 
 setup_logrotate_remnanode() {
   step "Logrotate — RemnaNode"
+  if [[ -f /etc/logrotate.d/remnanode ]]; then
+    log "Logrotate для RemnaNode уже настроен — пропускаю"
+    return
+  fi
   if ! command -v logrotate &>/dev/null; then
     case "$FAMILY" in
       debian) apt-get install -y logrotate ;;
@@ -619,6 +665,13 @@ EOF
 
   cat > "$conf_path" << EOF
 {
+  "_info": {
+    "_publicKey": "${public_key}",
+    "_privateKey": "${private_key}",
+    "_shortIds": "${short_ids[*]}",
+    "_domain": "${SNI_DOMAIN}",
+    "_dest": "127.0.0.1:${SNI_PORT}"
+  },
   "log": {
     "error": "/var/log/remnanode/error.log",
     "access": "/var/log/remnanode/access.log",
@@ -707,9 +760,10 @@ EOF
   log "Конфиг Xray сохранён: ${conf_path}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
   echo -e "  ${YELLOW}Private Key:${NC} ${private_key}"
-  echo -e "  ${YELLOW}Public Key:${NC}  ${public_key}"
+  echo -e "  ${YELLOW}Public Key:${NC}  ${public_key}  ${DIM}← вставлять в панель${NC}"
   echo -e "  ${YELLOW}Short IDs:${NC}   ${short_ids[*]}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${DIM}Ключи также сохранены в поле _info конфига: ${conf_path}${NC}"
 }
 
 install_remnanode() {
@@ -720,6 +774,44 @@ install_remnanode() {
 
   read -p "Secret Key ноды: " SECRET_KEY
   [[ -z "$SECRET_KEY" ]] && err "Secret Key не может быть пустым"
+
+  # Проверяем существующую установку
+  if [[ -f /opt/remnanode/docker-compose.yml ]]; then
+    local existing_port existing_key
+    existing_port=$(grep "NODE_PORT" /opt/remnanode/docker-compose.yml | grep -oE '[0-9]+' | head -1)
+    existing_key=$(grep "SECRET_KEY" /opt/remnanode/docker-compose.yml | sed 's/.*SECRET_KEY=//' | tr -d '"' | tr -d "'" | tr -d ' ')
+
+    if [[ "$existing_port" == "$NODE_PORT" && "$existing_key" == "$SECRET_KEY" ]]; then
+      # Порт и ключ совпадают — просто перезапускаем
+      info "Remnanode уже установлен с теми же параметрами — перезапускаю..."
+      if run_with_spinner "cd /opt/remnanode && docker compose pull && docker compose up -d" "Перезапуск Remnanode..."; then
+        log "Remnanode перезапущен"
+      else
+        err "Не удалось перезапустить Remnanode"
+      fi
+      echo ""
+      echo -e "${CYAN}──────────────────────────────────────────${NC}"
+      echo -e "  ${YELLOW}Порт:${NC}       ${NODE_PORT}"
+      echo -e "  ${YELLOW}Secret Key:${NC} ${SECRET_KEY}"
+      echo -e "  ${YELLOW}Статус:${NC}     перезапущен"
+      echo -e "${CYAN}──────────────────────────────────────────${NC}"
+      return
+    else
+      # Параметры отличаются — предупреждаем
+      warn "Remnanode уже установлен с другими параметрами:"
+      echo -e "  ${DIM}Текущий порт:  ${existing_port}  →  новый: ${NODE_PORT}${NC}"
+      echo -e "  ${DIM}Текущий ключ:  ${existing_key:0:10}...  →  новый: ${SECRET_KEY:0:10}...${NC}"
+      echo ""
+      echo -ne "${BOLD}  Обновить конфиг и перезапустить? (y/n):${NC} "
+      read -r update_confirm
+      if [[ ! $update_confirm =~ ^[Yy]$ ]]; then
+        info "Пропускаю установку Remnanode"
+        return
+      fi
+      # Останавливаем перед обновлением
+      run_with_spinner "cd /opt/remnanode && docker compose down" "Остановка Remnanode..." || true
+    fi
+  fi
 
   # Docker
   if ! command -v docker &>/dev/null; then
@@ -866,23 +958,42 @@ show_allowed_ips() {
 }
 
 # Главный модуль управления IP-фильтрацией
-menu_ip_filter() {
+menu_settings() {
   while true; do
     print_banner
     info "ОС: $OS_PRETTY"
     local node_port
     node_port=$(get_node_port)
+    local current_ssh_port
+    current_ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "$NEW_SSH_PORT")
     echo ""
-    echo -e "${BOLD}  НАСТРОЙКИ — IP-фильтрация порта ноды${NC}"
-    echo -e "  ${DIM}Порт ноды: ${node_port}${NC}"
+    echo -e "${BOLD}  НАСТРОЙКИ${NC}"
     echo ""
-    show_allowed_ips
 
-    echo -e "${BOLD}  ДЕЙСТВИЯ${NC}"
-    echo -e "  ${CYAN}[1]${NC}  Добавить IP (один или несколько через запятую)"
-    echo -e "  ${CYAN}[2]${NC}  Удалить конкретный IP"
+    # Статус IP-фильтрации
+    echo -e "  ${BOLD}IP-фильтрация порта ноды${NC} ${DIM}(порт: ${node_port})${NC}"
+    if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
+      local i=1
+      while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        echo -e "    ${YELLOW}[$i]${NC} $ip"
+        ((i++))
+      done < "$IP_FILTER_CONF"
+    else
+      echo -e "    ${DIM}Не настроена (стандартный: ${DEFAULT_ALLOWED_IP})${NC}"
+    fi
+    echo ""
+    echo -e "  ${BOLD}SSH порт:${NC} ${GREEN}${current_ssh_port}${NC}"
+    echo ""
+
+    echo -e "${BOLD}  IP-фильтрация${NC}"
+    echo -e "  ${CYAN}[1]${NC}  Добавить IP"
+    echo -e "  ${CYAN}[2]${NC}  Удалить IP по номеру"
     echo -e "  ${CYAN}[3]${NC}  Удалить все IP и сбросить правила"
     echo -e "  ${CYAN}[4]${NC}  Применить текущий список к файрволу"
+    echo ""
+    echo -e "${BOLD}  SSH${NC}"
+    echo -e "  ${CYAN}[5]${NC}  Сменить порт SSH"
     echo ""
     echo -e "  ${RED}[0]${NC}  ← Назад"
     echo ""
@@ -900,9 +1011,9 @@ menu_ip_filter() {
           IFS=',' read -ra new_ips <<< "$input_ips"
           local added=0
           for raw_ip in "${new_ips[@]}"; do
+            local ip
             ip=$(echo "$raw_ip" | tr -d ' ')
-            if [[ -z "$ip" ]]; then continue; fi
-            # Простая проверка формата
+            [[ -z "$ip" ]] && continue
             if ! echo "$ip" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]+)?$'; then
               warn "Некорректный IP: $ip — пропускаю"
               continue
@@ -916,7 +1027,6 @@ menu_ip_filter() {
             fi
           done
           if [[ $added -gt 0 ]]; then
-            # Применяем правила
             mapfile -t all_ips < "$IP_FILTER_CONF"
             apply_ip_rules "$node_port" "${all_ips[@]}"
             log "Правила файрвола обновлены"
@@ -927,19 +1037,16 @@ menu_ip_filter() {
         if [[ ! -f "$IP_FILTER_CONF" ]] || [[ ! -s "$IP_FILTER_CONF" ]]; then
           warn "Список пуст — нечего удалять"
         else
-          show_allowed_ips
           read -p "  Введите номер IP для удаления: " del_num
           if [[ "$del_num" =~ ^[0-9]+$ ]]; then
             del_ip=$(sed -n "${del_num}p" "$IP_FILTER_CONF")
             if [[ -n "$del_ip" ]]; then
               sed -i "${del_num}d" "$IP_FILTER_CONF"
               log "Удалён: $del_ip"
-              # Переприменяем оставшиеся правила
               mapfile -t all_ips < "$IP_FILTER_CONF"
               if [[ ${#all_ips[@]} -gt 0 ]]; then
                 apply_ip_rules "$node_port" "${all_ips[@]}"
               else
-                # Список пуст — закрываем порт для всех
                 case "$FAMILY" in
                   debian)
                     while ufw status numbered 2>/dev/null | grep -q "${node_port}"; do
@@ -959,7 +1066,7 @@ menu_ip_filter() {
                     firewall-cmd --reload 2>/dev/null || true
                     ;;
                 esac
-                warn "Список IP пуст — порт ${node_port} закрыт для всех. Добавь IP или сбрось настройки."
+                warn "Список IP пуст — порт ${node_port} закрыт для всех"
               fi
               log "Правила файрвола обновлены"
             else
@@ -1006,6 +1113,19 @@ menu_ip_filter() {
           mapfile -t all_ips < "$IP_FILTER_CONF"
           apply_ip_rules "$node_port" "${all_ips[@]}"
           log "Правила файрвола применены для ${#all_ips[@]} IP"
+        fi
+        ;;
+      5)
+        echo ""
+        echo -e "  ${DIM}Текущий порт SSH: ${current_ssh_port}${NC}"
+        read -p "  Новый порт SSH: " new_ssh
+        if [[ -z "$new_ssh" ]]; then
+          warn "Порт не введён"
+        elif ! [[ "$new_ssh" =~ ^[0-9]+$ ]] || [[ "$new_ssh" -lt 1 ]] || [[ "$new_ssh" -gt 65535 ]]; then
+          warn "Некорректный порт: $new_ssh"
+        else
+          NEW_SSH_PORT="$new_ssh"
+          setup_ssh_port
         fi
         ;;
       0) break ;;
@@ -1147,6 +1267,17 @@ menu_components() {
 }
 
 # ─── Меню 2: Полная установка ────────────────────────────────
+STATE_FILE="/etc/server-setup-state"
+
+# Записывает выполненный шаг
+state_set() { echo "$1" >> "$STATE_FILE"; }
+
+# Проверяет выполнен ли шаг
+state_done() { grep -qx "$1" "$STATE_FILE" 2>/dev/null; }
+
+# Сбрасывает состояние
+state_reset() { rm -f "$STATE_FILE"; }
+
 menu_full_install() {
   print_banner
   info "ОС: $OS_PRETTY"
@@ -1154,65 +1285,112 @@ menu_full_install() {
   echo -e "${BOLD}${CYAN}  ПОЛНАЯ УСТАНОВКА${NC}"
   echo -e "  ${DIM}Настройка сервера + Self SNI + Remnanode${NC}"
   echo ""
-  echo -e "${YELLOW}  Порядок установки:${NC}"
-  echo -e "  ${DIM}1. Базовая настройка сервера (swap, dns, пакеты, docker, firewall...)${NC}"
-  echo -e "  ${DIM}2. Self SNI — устанавливается ДО ноды (важно!)${NC}"
-  echo -e "  ${DIM}3. Remnanode — запускается последним${NC}"
-  echo ""
 
-  # Предупреждение об IP-фильтрации
-  echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
-  echo -e "  ${YELLOW}[!] IP-фильтрация порта ноды${NC}"
-  if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
-    echo -e "  ${GREEN}  Настроена. Разрешённые IP:${NC}"
-    while IFS= read -r ip; do
-      [[ -z "$ip" ]] && continue
-      echo -e "  ${DIM}    • $ip${NC}"
-    done < "$IP_FILTER_CONF"
+  # Проверяем незавершённую установку
+  if [[ -f "$STATE_FILE" ]] && [[ -s "$STATE_FILE" ]]; then
+    echo -e "${YELLOW}  [!] Обнаружена незавершённая установка!${NC}"
+    echo -e "  ${DIM}Выполненные шаги:${NC}"
+    while IFS= read -r s; do
+      echo -e "  ${GREEN}  ✓${NC} $s"
+    done < "$STATE_FILE"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC}  Продолжить с места остановки"
+    echo -e "  ${CYAN}[2]${NC}  Начать заново"
+    echo -e "  ${RED}[0]${NC}  Отмена"
+    echo ""
+    echo -ne "${BOLD}  Выбор:${NC} "
+    read -r resume_choice
+    case "$resume_choice" in
+      1) info "Продолжаю установку..." ;;
+      2) state_reset; info "Начинаю заново..." ;;
+      *) return ;;
+    esac
+    echo ""
   else
-    echo -e "  ${RED}  Не настроена!${NC}"
-    echo -e "  ${DIM}  Будет установлен стандартный IP: ${DEFAULT_ALLOWED_IP}${NC}"
-    echo -e "  ${DIM}  После установки настрой свои IP в пункте [3] Настройки${NC}"
-  fi
-  echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
-  echo ""
-  echo -ne "${BOLD}  Начать полную установку? (y/n):${NC} "
-  read -r confirm
-  [[ ! $confirm =~ ^[Yy]$ ]] && return
+    echo -e "${YELLOW}  Порядок установки:${NC}"
+    echo -e "  ${DIM}1. Базовая настройка сервера (swap, dns, пакеты, docker, firewall...)${NC}"
+    echo -e "  ${DIM}2. Self SNI — устанавливается ДО ноды (важно!)${NC}"
+    echo -e "  ${DIM}3. Remnanode — запускается последним${NC}"
+    echo ""
 
-  # Спрашиваем про Self SNI
-  echo ""
-  echo -ne "${BOLD}  Установить Self SNI? (y/n):${NC} "
-  read -r install_sni_choice
+    # Предупреждение об IP-фильтрации
+    echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}[!] IP-фильтрация порта ноды${NC}"
+    if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
+      echo -e "  ${GREEN}  Настроена. Разрешённые IP:${NC}"
+      while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        echo -e "  ${DIM}    • $ip${NC}"
+      done < "$IP_FILTER_CONF"
+    else
+      echo -e "  ${RED}  Не настроена!${NC}"
+      echo -e "  ${DIM}  Будет установлен стандартный IP: ${DEFAULT_ALLOWED_IP}${NC}"
+      echo -e "  ${DIM}  После установки настрой свои IP в пункте [3] Настройки${NC}"
+    fi
+    echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
+    echo ""
+    echo -ne "${BOLD}  Начать полную установку? (y/n):${NC} "
+    read -r confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+    # Спрашиваем про Self SNI
+    echo ""
+    echo -ne "${BOLD}  Установить Self SNI? (y/n):${NC} "
+    read -r install_sni_choice
+    # Сохраняем выбор в файл состояния
+    echo "SNI_CHOICE=${install_sni_choice}" > "$STATE_FILE"
+  fi
+
+  # Читаем сохранённый выбор SNI если продолжаем
+  if state_done "SNI_CHOICE=y" || state_done "SNI_CHOICE=Y"; then
+    install_sni_choice="y"
+  elif grep -q "^SNI_CHOICE=" "$STATE_FILE" 2>/dev/null; then
+    install_sni_choice="n"
+  fi
 
   # 1. Базовая настройка
-  step "ШАГ 1/3 — Базовая настройка сервера"
-  setup_swap
-  setup_dns
-  install_packages
-  install_docker
-  setup_firewall
-  setup_ssh_port
-  setup_fail2ban
-  install_micro
-  tune_network
-  setup_ssh_security
-  setup_logrotate_remnanode
-  cleanup
+  if ! state_done "base_setup"; then
+    step "ШАГ 1/3 — Базовая настройка сервера"
+    setup_swap
+    setup_dns
+    install_packages
+    install_docker
+    setup_firewall
+    setup_ssh_port
+    setup_fail2ban
+    install_micro
+    tune_network
+    setup_ssh_security
+    setup_logrotate_remnanode
+    cleanup
+    state_set "base_setup"
+  else
+    info "ШАГ 1/3 — Базовая настройка уже выполнена, пропускаю"
+  fi
 
   # 2. Self SNI (обязательно до ноды)
   if [[ $install_sni_choice =~ ^[Yy]$ ]]; then
-    echo ""
-    echo -e "${BOLD}${CYAN}══ ШАГ 2/3 — Self SNI ${DIM}(устанавливается до ноды)${NC}"
-    install_selfsni
+    if ! state_done "selfsni"; then
+      echo ""
+      echo -e "${BOLD}${CYAN}══ ШАГ 2/3 — Self SNI ${DIM}(устанавливается до ноды)${NC}"
+      install_selfsni
+      state_set "selfsni"
+    else
+      info "ШАГ 2/3 — Self SNI уже установлен, пропускаю"
+    fi
   else
     info "Self SNI пропущен"
   fi
 
   # 3. Remnanode
-  echo ""
-  step "ШАГ 3/3 — Remnanode"
-  install_remnanode
+  if ! state_done "remnanode"; then
+    echo ""
+    step "ШАГ 3/3 — Remnanode"
+    install_remnanode
+    state_set "remnanode"
+  else
+    info "ШАГ 3/3 — Remnanode уже установлен, пропускаю"
+  fi
 
   # Применяем IP-фильтрацию
   local node_port
@@ -1222,7 +1400,6 @@ menu_full_install() {
     apply_ip_rules "$node_port" "${all_ips[@]}"
     log "IP-фильтрация применена для порта ${node_port}"
   else
-    # Ставим дефолтный IP
     echo "$DEFAULT_ALLOWED_IP" > "$IP_FILTER_CONF"
     apply_ip_rules "$node_port" "$DEFAULT_ALLOWED_IP"
     echo ""
@@ -1230,6 +1407,8 @@ menu_full_install() {
     echo -e "${YELLOW}  [!] Настрой свои IP в пункте [3] Настройки главного меню!${NC}"
   fi
 
+  # Установка завершена — сбрасываем состояние
+  state_reset
   print_summary
 }
 
@@ -1248,15 +1427,17 @@ main_menu() {
     echo -e "       ${DIM}Настройка сервера + Self SNI + Remnanode${NC}"
     echo ""
     echo -e "  ${CYAN}[3]${NC}  ${BOLD}Настройки${NC}"
-    echo -e "       ${DIM}IP-фильтрация порта ноды${NC}"
-    # Показываем статус IP-фильтрации
+    echo -e "       ${DIM}IP-фильтрация, SSH порт${NC}"
     if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
       local ip_count
       ip_count=$(grep -c . "$IP_FILTER_CONF" 2>/dev/null || echo 0)
-      echo -e "       ${GREEN}✓ Настроена: ${ip_count} IP${NC}"
+      echo -e "       ${GREEN}✓ IP-фильтр: ${ip_count} IP${NC}"
     else
-      echo -e "       ${YELLOW}⚠ Не настроена (стандартный: ${DEFAULT_ALLOWED_IP})${NC}"
+      echo -e "       ${YELLOW}⚠ IP-фильтр не настроен${NC}"
     fi
+    echo ""
+    echo -e "  ${RED}[4]${NC}  ${BOLD}Удалить скрипт${NC}"
+    echo -e "       ${DIM}Удалить файл скрипта с сервера${NC}"
     echo ""
     echo -e "  ${RED}[0]${NC}  Выход"
     echo ""
@@ -1270,7 +1451,17 @@ main_menu() {
          echo -ne "${DIM}Нажми Enter для возврата в меню...${NC}"
          read -r
          ;;
-      3) menu_ip_filter ;;
+      3) menu_settings ;;
+      4)
+        echo ""
+        echo -ne "${RED}  Удалить скрипт ${BASH_SOURCE[0]}? (y/n):${NC} "
+        read -r del_confirm
+        if [[ $del_confirm =~ ^[Yy]$ ]]; then
+          rm -f "${BASH_SOURCE[0]}"
+          log "Скрипт удалён"
+          exit 0
+        fi
+        ;;
       0) echo -e "\n${DIM}Пока!${NC}\n"; exit 0 ;;
       *) warn "Неверный выбор: $choice" ;;
     esac
