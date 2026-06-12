@@ -280,7 +280,8 @@ setup_ssh_port() {
         cat > /etc/systemd/system/ssh.socket.d/override.conf << EOF
 [Socket]
 ListenStream=
-ListenStream=${NEW_SSH_PORT}
+ListenStream=0.0.0.0:${NEW_SSH_PORT}
+ListenStream=[::]:${NEW_SSH_PORT}
 EOF
         systemctl daemon-reload
         systemctl restart ssh.socket
