@@ -30,7 +30,7 @@
 ## Быстрый старт
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/refs/heads/main/server-setup -o server-setup.sh
+curl -fsSL https://raw.githubusercontent.com/WayneFX36/server-setup/refs/heads/main/server-setup.sh -o server-setup.sh
 chmod +x server-setup.sh
 sudo bash server-setup.sh
 ```
