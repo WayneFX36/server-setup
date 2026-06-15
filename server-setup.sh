@@ -847,12 +847,17 @@ EOF
 
 install_remnanode() {
   step "Установка Remnanode"
-
   read -p "Порт ноды (Enter для 2222): " NODE_PORT
   NODE_PORT=${NODE_PORT:-2222}
-
   read -p "Secret Key ноды: " SECRET_KEY
   [[ -z "$SECRET_KEY" ]] && err "Secret Key не может быть пустым"
+  _remnanode_install "$NODE_PORT" "$SECRET_KEY"
+}
+
+# Внутренняя функция — устанавливает ноду с готовыми параметрами
+_remnanode_install() {
+  local NODE_PORT="$1"
+  local SECRET_KEY="$2"
 
   # Проверяем существующую установку
   if [[ -f /opt/remnanode/docker-compose.yml ]]; then
@@ -1385,49 +1390,80 @@ menu_full_install() {
       *) return ;;
     esac
     echo ""
+    # Восстанавливаем сохранённые параметры
+    if state_done "SNI_CHOICE=y" || state_done "SNI_CHOICE=Y"; then
+      install_sni_choice="y"
+    else
+      install_sni_choice="n"
+    fi
+    FULL_NODE_PORT=$(grep "^NODE_PORT=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    FULL_SECRET_KEY=$(grep "^SECRET_KEY=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    FULL_PANEL_IP=$(grep "^PANEL_IP=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    FULL_NODE_PORT=${FULL_NODE_PORT:-2222}
   else
     echo -e "${YELLOW}  Порядок установки:${NC}"
-    echo -e "  ${DIM}1. Базовая настройка сервера (swap, dns, пакеты, docker, firewall...)${NC}"
+    echo -e "  ${DIM}1. Базовая настройка сервера${NC}"
     echo -e "  ${DIM}2. Self SNI — устанавливается ДО ноды (важно!)${NC}"
     echo -e "  ${DIM}3. Remnanode — запускается последним${NC}"
-    echo ""
-
-    # Предупреждение об IP-фильтрации
-    echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
-    echo -e "  ${YELLOW}[!] IP-фильтрация порта ноды${NC}"
-    if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
-      echo -e "  ${GREEN}  Настроена. Разрешённые IP:${NC}"
-      while IFS= read -r ip; do
-        [[ -z "$ip" ]] && continue
-        echo -e "  ${DIM}    • $ip${NC}"
-      done < "$IP_FILTER_CONF"
-    else
-      echo -e "  ${RED}  Не настроена!${NC}"
-      echo -e "  ${DIM}  Будет установлен стандартный IP: ${DEFAULT_ALLOWED_IP}${NC}"
-      echo -e "  ${DIM}  После установки настрой свои IP в пункте [3] Настройки${NC}"
-    fi
-    echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
     echo ""
     echo -ne "${BOLD}  Начать полную установку? (y/n):${NC} "
     read -r confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && return
 
-    # Спрашиваем про Self SNI
     echo ""
+    echo -e "${BOLD}${CYAN}  ── Параметры установки ──────────────────────────${NC}"
+    echo ""
+
+    # Self SNI
     echo -ne "${BOLD}  Установить Self SNI? (y/n):${NC} "
     read -r install_sni_choice
-    # Сохраняем выбор в файл состояния
+
+    # IP панели
+    if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
+      echo ""
+      echo -e "  ${GREEN}[✓] IP-фильтрация уже настроена:${NC}"
+      while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        echo -e "  ${DIM}    • $ip${NC}"
+      done < "$IP_FILTER_CONF"
+      FULL_PANEL_IP=""
+    else
+      echo ""
+      read -p "  IP панели управления (Enter = пропустить, настроить позже): " FULL_PANEL_IP
+    fi
+
+    # Порт ноды и ключ
+    echo ""
+    read -p "  Порт ноды (Enter для 2222): " FULL_NODE_PORT
+    FULL_NODE_PORT=${FULL_NODE_PORT:-2222}
+    read -p "  Secret Key ноды: " FULL_SECRET_KEY
+    if [[ -z "$FULL_SECRET_KEY" ]]; then
+      warn "Secret Key не может быть пустым"
+      return
+    fi
+
+    # Итоговый экран подтверждения
+    echo ""
+    echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}Self SNI:   $(echo "$install_sni_choice" | grep -qi y && echo "да" || echo "нет")${NC}"
+    echo -e "  ${DIM}Порт ноды:  ${FULL_NODE_PORT}${NC}"
+    echo -e "  ${DIM}Secret Key: ${FULL_SECRET_KEY:0:8}...${NC}"
+    [[ -n "$FULL_PANEL_IP" ]] && echo -e "  ${DIM}IP панели:  ${FULL_PANEL_IP}${NC}"
+    echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
+    echo ""
+    echo -ne "${BOLD}  Всё верно? (y/n):${NC} "
+    read -r final_confirm
+    [[ ! $final_confirm =~ ^[Yy]$ ]] && return
+
+    # Сохраняем параметры в state
     echo "SNI_CHOICE=${install_sni_choice}" > "$STATE_FILE"
+    echo "NODE_PORT=${FULL_NODE_PORT}" >> "$STATE_FILE"
+    echo "SECRET_KEY=${FULL_SECRET_KEY}" >> "$STATE_FILE"
+    [[ -n "$FULL_PANEL_IP" ]] && echo "PANEL_IP=${FULL_PANEL_IP}" >> "$STATE_FILE"
+    [[ -n "$FULL_PANEL_IP" ]] && echo "$FULL_PANEL_IP" > "$IP_FILTER_CONF"
   fi
 
-  # Читаем сохранённый выбор SNI если продолжаем
-  if state_done "SNI_CHOICE=y" || state_done "SNI_CHOICE=Y"; then
-    install_sni_choice="y"
-  elif grep -q "^SNI_CHOICE=" "$STATE_FILE" 2>/dev/null; then
-    install_sni_choice="n"
-  fi
-
-  # 1. Базовая настройка
+  # 1. Базовая настройка (setup_ssh_security убрана — интерактивная)
   if ! state_done "base_setup"; then
     step "ШАГ 1/3 — Базовая настройка сервера"
     setup_swap
@@ -1439,7 +1475,6 @@ menu_full_install() {
     setup_fail2ban
     install_micro
     tune_network
-    setup_ssh_security
     setup_logrotate_remnanode
     cleanup
     state_set "base_setup"
@@ -1461,11 +1496,11 @@ menu_full_install() {
     info "Self SNI пропущен"
   fi
 
-  # 3. Remnanode
+  # 3. Remnanode с уже собранными параметрами
   if ! state_done "remnanode"; then
     echo ""
     step "ШАГ 3/3 — Remnanode"
-    install_remnanode
+    _remnanode_install "$FULL_NODE_PORT" "$FULL_SECRET_KEY"
     state_set "remnanode"
   else
     info "ШАГ 3/3 — Remnanode уже установлен, пропускаю"
@@ -1479,17 +1514,15 @@ menu_full_install() {
     apply_ip_rules "$node_port" "${all_ips[@]}"
     log "IP-фильтрация применена для порта ${node_port}"
   else
-    echo "$DEFAULT_ALLOWED_IP" > "$IP_FILTER_CONF"
-    apply_ip_rules "$node_port" "$DEFAULT_ALLOWED_IP"
     echo ""
-    echo -e "${YELLOW}  [!] Применён стандартный IP-фильтр: ${DEFAULT_ALLOWED_IP}${NC}"
-    echo -e "${YELLOW}  [!] Настрой свои IP в пункте [3] Настройки главного меню!${NC}"
+    echo -e "${YELLOW}  [!] IP-фильтрация не настроена — порт ${node_port} открыт для всех${NC}"
+    echo -e "${YELLOW}  [!] Настрой IP в пункте [3] Настройки главного меню${NC}"
   fi
 
-  # Установка завершена — сбрасываем состояние
   state_reset
   print_summary
 }
+
 
 # ─── Главное меню ────────────────────────────────────────────
 main_menu() {
