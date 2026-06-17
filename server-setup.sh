@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 
 # ============================================================
-#  SERVER SETUP  v1.2  —  Первоначальная настройка сервера
+#  SERVER SETUP  v1.3  —  Первоначальная настройка сервера
 #  Поддержка: Ubuntu 20.04/22.04/24.04
 #             Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9
 # ============================================================
-
-set -e
 
 # ─── Конфигурация ────────────────────────────────────────────
 NEW_SSH_PORT=29650
@@ -23,6 +21,31 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $*"; }
 step() { echo -e "\n${BOLD}${CYAN}══ $* ${NC}"; }
+
+# ─── Запуск шага с возможностью пропустить / повторить ───────
+run_step() {
+  local name="$1"
+  local func="$2"
+  while true; do
+    if eval "$func"; then
+      return 0
+    else
+      echo ""
+      echo -e "${RED}  [✗] Шаг «${name}» завершился с ошибкой${NC}"
+      echo -e "  ${CYAN}[1]${NC}  Повторить"
+      echo -e "  ${CYAN}[2]${NC}  Пропустить и продолжить"
+      echo -e "  ${RED}[0]${NC}  Прервать установку"
+      echo ""
+      echo -ne "${BOLD}  Выбор:${NC} "
+      read -r step_choice
+      case "$step_choice" in
+        1) continue ;;
+        2) warn "Шаг «${name}» пропущен"; return 0 ;;
+        *) err "Установка прервана пользователем" ;;
+      esac
+    fi
+  done
+}
 
 # ─── Спиннер ─────────────────────────────────────────────────
 run_with_spinner() {
@@ -538,16 +561,19 @@ install_selfsni() {
   echo -e "  ${YELLOW}4)${NC} Блог / Медиа"
   echo -e "  ${YELLOW}5)${NC} Личный сайт"
   echo -e "  ${YELLOW}6)${NC} Случайный из коллекции"
+  echo -e "  ${YELLOW}7)${NC} Свой шаблон (установлю сам)"
   read -p "Номер шаблона (Enter для 6): " TMPL
   TMPL=${TMPL:-6}
 
+  local CUSTOM_TMPL=false
   case $TMPL in
-    1) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-creative.git"; WEBROOT="/usr/share/nginx/html/dist" ;;
-    2) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-freelancer.git"; WEBROOT="/usr/share/nginx/html/dist" ;;
-    3) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-new-age.git"; WEBROOT="/usr/share/nginx/html/dist" ;;
-    4) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-clean-blog.git"; WEBROOT="/usr/share/nginx/html/dist" ;;
-    5) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-resume.git"; WEBROOT="/usr/share/nginx/html/dist" ;;
-    *) TMPL_URL="https://github.com/learning-zone/website-templates.git"; WEBROOT="/usr/share/nginx/html"; TMPL=6 ;;
+    1) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-creative.git";   WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
+    2) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-freelancer.git"; WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
+    3) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-new-age.git";    WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
+    4) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-clean-blog.git"; WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
+    5) TMPL_URL="https://github.com/StartBootstrap/startbootstrap-resume.git";     WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
+    7) CUSTOM_TMPL=true; WEBROOT="${NGINX_WEBROOT_BASE}" ;;
+    *) TMPL_URL="https://github.com/learning-zone/website-templates.git"; WEBROOT="${NGINX_WEBROOT_BASE}"; TMPL=6 ;;
   esac
 
   # Проверка DNS
@@ -587,21 +613,26 @@ install_selfsni() {
   esac
 
   # Шаблон сайта
-  TEMP_DIR=$(mktemp -d)
-  if run_with_spinner "git clone --depth 1 $TMPL_URL $TEMP_DIR" "Загрузка шаблона..."; then
+  if [[ "$CUSTOM_TMPL" == "true" ]]; then
     mkdir -p "$NGINX_WEBROOT_BASE"
-    if [[ "$TMPL" == "6" ]]; then
-      SITE_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | shuf -n 1)
-      cp -r "$SITE_DIR"/* "$NGINX_WEBROOT_BASE"/ 2>/dev/null
-    else
-      cp -r "$TEMP_DIR"/* "$NGINX_WEBROOT_BASE"/ 2>/dev/null
-    fi
-    log "Шаблон установлен"
+    info "Шаблон будет установлен вручную — инструкции в конце"
   else
+    TEMP_DIR=$(mktemp -d)
+    if run_with_spinner "git clone --depth 1 $TMPL_URL $TEMP_DIR" "Загрузка шаблона..."; then
+      mkdir -p "$NGINX_WEBROOT_BASE"
+      if [[ "$TMPL" == "6" ]]; then
+        SITE_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | shuf -n 1)
+        cp -r "$SITE_DIR"/* "$NGINX_WEBROOT_BASE"/ 2>/dev/null
+      else
+        cp -r "$TEMP_DIR"/* "$NGINX_WEBROOT_BASE"/ 2>/dev/null
+      fi
+      log "Шаблон установлен"
+    else
+      rm -rf "$TEMP_DIR"
+      err "Не удалось загрузить шаблон"
+    fi
     rm -rf "$TEMP_DIR"
-    err "Не удалось загрузить шаблон"
   fi
-  rm -rf "$TEMP_DIR"
 
   # SSL сертификат
   if run_with_spinner "certbot certonly --standalone -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата..."; then
@@ -835,6 +866,29 @@ EOF
   echo -e "  ${YELLOW}Dest:${NC}       127.0.0.1:${SNI_PORT}"
   echo -e "  ${YELLOW}SNI:${NC}        ${SNI_DOMAIN}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
+
+  # Инструкции для кастомного шаблона
+  if [[ "$CUSTOM_TMPL" == "true" ]]; then
+    echo ""
+    echo -e "${YELLOW}  ┌─ Установка своего шаблона ──────────────────────┐${NC}"
+    echo -e "${YELLOW}  │${NC}  Скопируй файлы сайта в директорию:             ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  ${BOLD}${NGINX_WEBROOT_BASE}${NC}  ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}                                                 ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  Например через scp с локальной машины:         ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  ${DIM}scp -r ./my-site/* root@$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "<IP>"):${NGINX_WEBROOT_BASE}/${NC}  ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}                                                 ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  Или клонировать репозиторий на сервере:        ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  ${DIM}cd ${NGINX_WEBROOT_BASE}${NC}  ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  ${DIM}git clone <url> .${NC}                              ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}                                                 ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  Если index.html не в корне, а в подпапке       ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  (например dist/), обнови путь в конфиге nginx: ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  ${DIM}nano /etc/nginx/conf.d/sni.conf${NC}  ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  Найди строку ${DIM}root${NC} и замени путь, затем:       ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  │${NC}  ${DIM}nginx -t && systemctl reload nginx${NC}             ${YELLOW}│${NC}"
+    echo -e "${YELLOW}  └─────────────────────────────────────────────────┘${NC}"
+  fi
+
   echo ""
   log "Конфиг Xray сохранён: ${conf_path}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
@@ -1466,17 +1520,17 @@ menu_full_install() {
   # 1. Базовая настройка (setup_ssh_security убрана — интерактивная)
   if ! state_done "base_setup"; then
     step "ШАГ 1/3 — Базовая настройка сервера"
-    setup_swap
-    setup_dns
-    install_packages
-    install_docker
-    setup_firewall
-    setup_ssh_port
-    setup_fail2ban
-    install_micro
-    tune_network
-    setup_logrotate_remnanode
-    cleanup
+    run_step "Swap"              setup_swap
+    run_step "DNS"               setup_dns
+    run_step "Пакеты"            install_packages
+    run_step "Docker"            install_docker
+    run_step "Файрвол"           setup_firewall
+    run_step "SSH порт"          setup_ssh_port
+    run_step "Fail2ban"          setup_fail2ban
+    run_step "Micro"             install_micro
+    run_step "Сеть BBR"          tune_network
+    run_step "Logrotate"         setup_logrotate_remnanode
+    run_step "Очистка"           cleanup
     state_set "base_setup"
   else
     info "ШАГ 1/3 — Базовая настройка уже выполнена, пропускаю"
@@ -1487,7 +1541,7 @@ menu_full_install() {
     if ! state_done "selfsni"; then
       echo ""
       echo -e "${BOLD}${CYAN}══ ШАГ 2/3 — Self SNI ${DIM}(устанавливается до ноды)${NC}"
-      install_selfsni
+      run_step "Self SNI" install_selfsni
       state_set "selfsni"
     else
       info "ШАГ 2/3 — Self SNI уже установлен, пропускаю"
@@ -1500,7 +1554,7 @@ menu_full_install() {
   if ! state_done "remnanode"; then
     echo ""
     step "ШАГ 3/3 — Remnanode"
-    _remnanode_install "$FULL_NODE_PORT" "$FULL_SECRET_KEY"
+    run_step "Remnanode" "_remnanode_install \"$FULL_NODE_PORT\" \"$FULL_SECRET_KEY\""
     state_set "remnanode"
   else
     info "ШАГ 3/3 — Remnanode уже установлен, пропускаю"
