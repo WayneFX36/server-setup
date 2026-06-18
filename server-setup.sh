@@ -41,7 +41,7 @@ run_step() {
       case "$step_choice" in
         1) continue ;;
         2) warn "Шаг «${name}» пропущен"; return 0 ;;
-        *) err "Установка прервана пользователем" ;;
+        *) warn "Установка прервана. Запусти скрипт снова для продолжения."; return 1 ;;
       esac
     fi
   done
@@ -530,21 +530,13 @@ install_selfsni() {
         dnsutils bind9-dnsutils 2>/dev/null || \
       DEBIAN_FRONTEND=noninteractive apt-get install -y \
         nginx certbot python3-certbot-nginx git curl dnsutils
-      # Ubuntu/Debian: webroot в /var/www/html
       NGINX_WEBROOT_BASE="/var/www/html"
       ;;
     rhel)
       dnf install -y epel-release 2>/dev/null || true
       dnf install -y nginx certbot python3-certbot-nginx git curl bind-utils
-      # Rocky/RHEL: webroot в /usr/share/nginx/html
       NGINX_WEBROOT_BASE="/usr/share/nginx/html"
       ;;
-  esac
-
-  # Пересчитываем WEBROOT с правильным base
-  case $TMPL in
-    1|2|3|4|5) WEBROOT="${NGINX_WEBROOT_BASE}/dist" ;;
-    *)          WEBROOT="${NGINX_WEBROOT_BASE}" ;;
   esac
 
   read -p "Введите доменное имя для SNI: " SNI_DOMAIN
@@ -580,24 +572,26 @@ install_selfsni() {
   info "Проверка A-записи домена..."
   domain_ip=$(dig +short A "$SNI_DOMAIN" | head -n1)
   [[ -z "$domain_ip" ]] && err "Не удалось получить A-запись для $SNI_DOMAIN"
-
-  # Получаем все IP адреса сервера
   all_server_ips=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.')
-  # Также проверяем через внешний сервис
   external_ip=$(curl -s --max-time 5 https://api.ipify.org)
   [[ -n "$external_ip" ]] && all_server_ips=$(echo -e "$all_server_ips\n$external_ip")
-
   if ! echo "$all_server_ips" | grep -qx "$domain_ip"; then
     err "A-запись $SNI_DOMAIN ($domain_ip) не совпадает ни с одним IP сервера"
   fi
   log "DNS корректен: $SNI_DOMAIN → $domain_ip"
 
-  # Остановка nginx и проверка портов
+  # Остановка nginx
   systemctl stop nginx 2>/dev/null || true
-  ss -tuln | grep -q ":443 " && err "Порт 443 занят"
-  ss -tuln | grep -q ":80 "  && err "Порт 80 занят"
 
-  # Открытие портов
+  # Проверяем порты — но только на процессы кроме nginx
+  # При полной установке Xray/remnanode может занимать 443, это нормально
+  port80_owner=$(ss -tlnp | grep ":80 " | grep -v nginx | head -1)
+  if [[ -n "$port80_owner" ]]; then
+    warn "Порт 80 занят другим процессом: $port80_owner"
+    warn "certbot не сможет получить сертификат standalone методом"
+  fi
+
+  # Открытие портов в firewall
   case "$FAMILY" in
     debian)
       ufw allow 80/tcp comment 'HTTP' 2>/dev/null || true
@@ -634,11 +628,48 @@ install_selfsni() {
     rm -rf "$TEMP_DIR"
   fi
 
-  # SSL сертификат
-  if run_with_spinner "certbot certonly --standalone -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата..."; then
-    log "SSL сертификат получен"
+  # SSL сертификат — используем webroot если порт 80 занят, standalone если свободен
+  if ss -tlnp | grep -q ":80 "; then
+    # Порт 80 занят — используем webroot метод через nginx
+    mkdir -p "$NGINX_WEBROOT_BASE/.well-known/acme-challenge"
+    # Временный конфиг для получения сертификата
+    if [[ "$FAMILY" == "debian" ]]; then
+      cat > /etc/nginx/sites-available/sni-temp.conf << TEMPEOF
+server {
+    listen 80;
+    server_name ${SNI_DOMAIN};
+    root ${NGINX_WEBROOT_BASE};
+    location /.well-known/acme-challenge/ { allow all; }
+}
+TEMPEOF
+      ln -sf /etc/nginx/sites-available/sni-temp.conf /etc/nginx/sites-enabled/sni-temp.conf
+    else
+      cat > /etc/nginx/conf.d/sni-temp.conf << TEMPEOF
+server {
+    listen 8080;
+    server_name ${SNI_DOMAIN};
+    root ${NGINX_WEBROOT_BASE};
+    location /.well-known/acme-challenge/ { allow all; }
+}
+TEMPEOF
+    fi
+    systemctl enable nginx > /dev/null 2>&1
+    nginx -t > /dev/null 2>&1 && systemctl start nginx 2>/dev/null || true
+    if run_with_spinner "certbot certonly --webroot -w $NGINX_WEBROOT_BASE -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата (webroot)..."; then
+      log "SSL сертификат получен"
+    else
+      err "Не удалось получить SSL сертификат"
+    fi
+    # Удаляем временный конфиг
+    rm -f /etc/nginx/sites-enabled/sni-temp.conf /etc/nginx/sites-available/sni-temp.conf 2>/dev/null || true
+    rm -f /etc/nginx/conf.d/sni-temp.conf 2>/dev/null || true
   else
-    err "Не удалось получить SSL сертификат"
+    # Порт 80 свободен — standalone
+    if run_with_spinner "certbot certonly --standalone -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата (standalone)..."; then
+      log "SSL сертификат получен"
+    else
+      err "Не удалось получить SSL сертификат"
+    fi
   fi
 
   # Автопродление
@@ -1024,6 +1055,16 @@ EOF
 
 IP_FILTER_CONF="/etc/remnanode-allowed-ips.conf"
 DEFAULT_ALLOWED_IP="1.1.1.1"
+STATE_FILE="/etc/server-setup-state"
+
+# Записывает выполненный шаг
+state_set() { echo "$1" >> "$STATE_FILE"; }
+
+# Проверяет выполнен ли шаг
+state_done() { grep -qx "$1" "$STATE_FILE" 2>/dev/null; }
+
+# Сбрасывает состояние
+state_reset() { rm -f "$STATE_FILE"; }
 
 # Читает текущий порт ноды из docker-compose.yml
 get_node_port() {
@@ -1389,7 +1430,6 @@ menu_components() {
         setup_fail2ban
         install_micro
         tune_network
-        setup_ssh_security
         setup_logrotate_remnanode
         cleanup
         print_summary
@@ -1405,17 +1445,6 @@ menu_components() {
 }
 
 # ─── Меню 2: Полная установка ────────────────────────────────
-STATE_FILE="/etc/server-setup-state"
-
-# Записывает выполненный шаг
-state_set() { echo "$1" >> "$STATE_FILE"; }
-
-# Проверяет выполнен ли шаг
-state_done() { grep -qx "$1" "$STATE_FILE" 2>/dev/null; }
-
-# Сбрасывает состояние
-state_reset() { rm -f "$STATE_FILE"; }
-
 menu_full_install() {
   print_banner
   info "ОС: $OS_PRETTY"
@@ -1445,15 +1474,21 @@ menu_full_install() {
     esac
     echo ""
     # Восстанавливаем сохранённые параметры
-    if state_done "SNI_CHOICE=y" || state_done "SNI_CHOICE=Y"; then
+    install_sni_choice="n"
+    if grep -qi "^SNI_CHOICE=y" "$STATE_FILE" 2>/dev/null; then
       install_sni_choice="y"
-    else
-      install_sni_choice="n"
     fi
     FULL_NODE_PORT=$(grep "^NODE_PORT=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_SECRET_KEY=$(grep "^SECRET_KEY=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_PANEL_IP=$(grep "^PANEL_IP=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_NODE_PORT=${FULL_NODE_PORT:-2222}
+    if [[ -z "$FULL_SECRET_KEY" ]]; then
+      warn "Secret Key не найден в сохранённых данных — введи заново"
+      read -p "  Secret Key ноды: " FULL_SECRET_KEY
+      [[ -z "$FULL_SECRET_KEY" ]] && { warn "Отмена"; return; }
+      sed -i '/^SECRET_KEY=/d' "$STATE_FILE"
+      echo "SECRET_KEY=${FULL_SECRET_KEY}" >> "$STATE_FILE"
+    fi
   else
     echo -e "${YELLOW}  Порядок установки:${NC}"
     echo -e "  ${DIM}1. Базовая настройка сервера${NC}"
