@@ -409,19 +409,43 @@ EOF
 install_micro() {
   step "Micro редактор"
   if command -v micro &>/dev/null; then
-    info "Micro уже установлен: $(micro --version 2>&1 | head -1)"
+    log "Micro уже установлен: $(micro --version 2>&1 | head -1) — пропускаю"
     return
   fi
-  cd /tmp
-  curl -fsSL https://getmic.ro | bash
-  if [[ -f ./micro ]]; then
-    mv ./micro /usr/local/bin/micro
-    chmod +x /usr/local/bin/micro
-    log "Micro установлен: $(micro --version 2>&1 | head -1)"
-  else
-    warn "Micro не скачался — пропускаю"
-  fi
-  cd - > /dev/null
+  case "$FAMILY" in
+    debian)
+      if run_with_spinner "DEBIAN_FRONTEND=noninteractive apt-get install -y micro" "Установка micro..."; then
+        log "Micro установлен: $(micro --version 2>&1 | head -1)"
+        return
+      fi
+      # Фоллбэк — snap
+      if command -v snap &>/dev/null; then
+        if run_with_spinner "snap install micro --classic" "Установка micro через snap..."; then
+          log "Micro установлен через snap"
+          return
+        fi
+      fi
+      warn "Не удалось установить micro — пропускаю"
+      ;;
+    rhel)
+      if run_with_spinner "dnf install -y micro" "Установка micro..."; then
+        log "Micro установлен: $(micro --version 2>&1 | head -1)"
+        return
+      fi
+      # Фоллбэк — бинарник с GitHub releases (без getmic.ro)
+      local micro_url
+      micro_url=$(curl -s https://api.github.com/repos/zyedidia/micro/releases/latest \
+        | grep "browser_download_url.*linux64.tar.gz" | head -1 | cut -d'"' -f4)
+      if [[ -n "$micro_url" ]]; then
+        if run_with_spinner "curl -fsSL '$micro_url' -o /tmp/micro.tar.gz && tar -xzf /tmp/micro.tar.gz -C /tmp && find /tmp -name 'micro' -type f | head -1 | xargs -I{} mv {} /usr/local/bin/micro && rm -rf /tmp/micro*" "Установка micro (fallback)..."; then
+          chmod +x /usr/local/bin/micro
+          log "Micro установлен: $(micro --version 2>&1 | head -1)"
+          return
+        fi
+      fi
+      warn "Не удалось установить micro — пропускаю"
+      ;;
+  esac
 }
 
 tune_network() {
@@ -520,7 +544,23 @@ cleanup() {
 # ═══════════════════════════════════════════════════════════════
 
 install_selfsni() {
-  step "Установка Self SNI"
+  # При ручном вызове из меню — спрашиваем домен и порт
+  local domain port
+  read -p "Введите доменное имя для SNI: " domain
+  [[ -z "$domain" ]] && { warn "Домен не может быть пустым"; return 1; }
+  read -p "Внутренний SNI порт (Enter для 9000): " port
+  port=${port:-9000}
+  _install_selfsni_with_params "$domain" "$port"
+}
+
+# Внутренняя функция — принимает домен и порт как аргументы
+_install_selfsni_with_params() {
+  local SNI_DOMAIN="$1"
+  local SNI_PORT="$2"
+  [[ -z "$SNI_DOMAIN" ]] && { warn "Домен не указан"; return 1; }
+  SNI_PORT=${SNI_PORT:-9000}
+
+  step "Установка Self SNI (${SNI_DOMAIN})"
 
   # Зависимости для SNI
   case "$FAMILY" in
@@ -538,12 +578,6 @@ install_selfsni() {
       NGINX_WEBROOT_BASE="/usr/share/nginx/html"
       ;;
   esac
-
-  read -p "Введите доменное имя для SNI: " SNI_DOMAIN
-  [[ -z "$SNI_DOMAIN" ]] && err "Доменное имя не может быть пустым"
-
-  read -p "Внутренний SNI порт (Enter для 9000): " SNI_PORT
-  SNI_PORT=${SNI_PORT:-9000}
 
   echo ""
   echo -e "${CYAN}Выберите шаблон сайта:${NC}"
@@ -948,7 +982,7 @@ _remnanode_install() {
   if [[ -f /opt/remnanode/docker-compose.yml ]]; then
     local existing_port existing_key
     existing_port=$(grep "NODE_PORT" /opt/remnanode/docker-compose.yml | grep -oE '[0-9]+' | head -1)
-    existing_key=$(grep "SECRET_KEY" /opt/remnanode/docker-compose.yml | sed 's/.*SECRET_KEY=//' | tr -d '"' | tr -d "'" | tr -d ' ')
+    existing_key=$(grep "SECRET_KEY" /opt/remnanode/docker-compose.yml | sed 's/.*SECRET_KEY[=:][[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d ' ' | tr -d '\r')
 
     if [[ "$existing_port" == "$NODE_PORT" && "$existing_key" == "$SECRET_KEY" ]]; then
       # Порт и ключ совпадают — просто перезапускаем
@@ -1481,7 +1515,10 @@ menu_full_install() {
     FULL_NODE_PORT=$(grep "^NODE_PORT=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_SECRET_KEY=$(grep "^SECRET_KEY=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_PANEL_IP=$(grep "^PANEL_IP=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    FULL_SNI_DOMAIN=$(grep "^SNI_DOMAIN=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    FULL_SNI_PORT=$(grep "^SNI_PORT=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_NODE_PORT=${FULL_NODE_PORT:-2222}
+    FULL_SNI_PORT=${FULL_SNI_PORT:-9000}
     if [[ -z "$FULL_SECRET_KEY" ]]; then
       warn "Secret Key не найден в сохранённых данных — введи заново"
       read -p "  Secret Key ноды: " FULL_SECRET_KEY
@@ -1506,6 +1543,17 @@ menu_full_install() {
     # Self SNI
     echo -ne "${BOLD}  Установить Self SNI? (y/n):${NC} "
     read -r install_sni_choice
+
+    # Если SNI — спрашиваем домен и порт сразу
+    FULL_SNI_DOMAIN=""
+    FULL_SNI_PORT="9000"
+    if [[ $install_sni_choice =~ ^[Yy]$ ]]; then
+      echo ""
+      read -p "  Домен для Self SNI: " FULL_SNI_DOMAIN
+      [[ -z "$FULL_SNI_DOMAIN" ]] && { warn "Домен не может быть пустым"; return; }
+      read -p "  Внутренний SNI порт (Enter для 9000): " FULL_SNI_PORT
+      FULL_SNI_PORT=${FULL_SNI_PORT:-9000}
+    fi
 
     # IP панели
     if [[ -f "$IP_FILTER_CONF" ]] && [[ -s "$IP_FILTER_CONF" ]]; then
@@ -1534,7 +1582,7 @@ menu_full_install() {
     # Итоговый экран подтверждения
     echo ""
     echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
-    echo -e "  ${DIM}Self SNI:   $(echo "$install_sni_choice" | grep -qi y && echo "да" || echo "нет")${NC}"
+    echo -e "  ${DIM}Self SNI:   $(echo "$install_sni_choice" | grep -qi y && echo "да (${FULL_SNI_DOMAIN}:${FULL_SNI_PORT})" || echo "нет")${NC}"
     echo -e "  ${DIM}Порт ноды:  ${FULL_NODE_PORT}${NC}"
     echo -e "  ${DIM}Secret Key: ${FULL_SECRET_KEY:0:8}...${NC}"
     [[ -n "$FULL_PANEL_IP" ]] && echo -e "  ${DIM}IP панели:  ${FULL_PANEL_IP}${NC}"
@@ -1546,6 +1594,8 @@ menu_full_install() {
 
     # Сохраняем параметры в state
     echo "SNI_CHOICE=${install_sni_choice}" > "$STATE_FILE"
+    echo "SNI_DOMAIN=${FULL_SNI_DOMAIN}" >> "$STATE_FILE"
+    echo "SNI_PORT=${FULL_SNI_PORT}" >> "$STATE_FILE"
     echo "NODE_PORT=${FULL_NODE_PORT}" >> "$STATE_FILE"
     echo "SECRET_KEY=${FULL_SECRET_KEY}" >> "$STATE_FILE"
     [[ -n "$FULL_PANEL_IP" ]] && echo "PANEL_IP=${FULL_PANEL_IP}" >> "$STATE_FILE"
@@ -1576,7 +1626,7 @@ menu_full_install() {
     if ! state_done "selfsni"; then
       echo ""
       echo -e "${BOLD}${CYAN}══ ШАГ 2/3 — Self SNI ${DIM}(устанавливается до ноды)${NC}"
-      run_step "Self SNI" install_selfsni
+      run_step "Self SNI" "_install_selfsni_with_params \"$FULL_SNI_DOMAIN\" \"$FULL_SNI_PORT\""
       state_set "selfsni"
     else
       info "ШАГ 2/3 — Self SNI уже установлен, пропускаю"
