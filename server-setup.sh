@@ -544,19 +544,31 @@ cleanup() {
 # ═══════════════════════════════════════════════════════════════
 
 install_selfsni() {
-  # При ручном вызове из меню — спрашиваем домен и порт
-  local domain port
+  # При ручном вызове из меню — спрашиваем все параметры
+  local domain port tmpl
   read -p "Введите доменное имя для SNI: " domain
   [[ -z "$domain" ]] && { warn "Домен не может быть пустым"; return 1; }
   read -p "Внутренний SNI порт (Enter для 9000): " port
   port=${port:-9000}
-  _install_selfsni_with_params "$domain" "$port"
+  echo ""
+  echo -e "${CYAN}Выберите шаблон сайта:${NC}"
+  echo -e "  ${YELLOW}1)${NC} Бизнес / Корпоративный"
+  echo -e "  ${YELLOW}2)${NC} Портфолио / Агентство"
+  echo -e "  ${YELLOW}3)${NC} Технологии / SaaS"
+  echo -e "  ${YELLOW}4)${NC} Блог / Медиа"
+  echo -e "  ${YELLOW}5)${NC} Личный сайт"
+  echo -e "  ${YELLOW}6)${NC} Случайный из коллекции"
+  echo -e "  ${YELLOW}7)${NC} Свой шаблон (установлю сам)"
+  read -p "Номер шаблона (Enter для 6): " tmpl
+  tmpl=${tmpl:-6}
+  _install_selfsni_with_params "$domain" "$port" "$tmpl"
 }
 
-# Внутренняя функция — принимает домен и порт как аргументы
+# Внутренняя функция — принимает домен, порт и номер шаблона как аргументы
 _install_selfsni_with_params() {
   local SNI_DOMAIN="$1"
   local SNI_PORT="$2"
+  local TMPL="${3:-6}"
   [[ -z "$SNI_DOMAIN" ]] && { warn "Домен не указан"; return 1; }
   SNI_PORT=${SNI_PORT:-9000}
 
@@ -578,18 +590,6 @@ _install_selfsni_with_params() {
       NGINX_WEBROOT_BASE="/usr/share/nginx/html"
       ;;
   esac
-
-  echo ""
-  echo -e "${CYAN}Выберите шаблон сайта:${NC}"
-  echo -e "  ${YELLOW}1)${NC} Бизнес / Корпоративный"
-  echo -e "  ${YELLOW}2)${NC} Портфолио / Агентство"
-  echo -e "  ${YELLOW}3)${NC} Технологии / SaaS"
-  echo -e "  ${YELLOW}4)${NC} Блог / Медиа"
-  echo -e "  ${YELLOW}5)${NC} Личный сайт"
-  echo -e "  ${YELLOW}6)${NC} Случайный из коллекции"
-  echo -e "  ${YELLOW}7)${NC} Свой шаблон (установлю сам)"
-  read -p "Номер шаблона (Enter для 6): " TMPL
-  TMPL=${TMPL:-6}
 
   local CUSTOM_TMPL=false
   case $TMPL in
@@ -1517,8 +1517,10 @@ menu_full_install() {
     FULL_PANEL_IP=$(grep "^PANEL_IP=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_SNI_DOMAIN=$(grep "^SNI_DOMAIN=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_SNI_PORT=$(grep "^SNI_PORT=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+    FULL_SNI_TMPL=$(grep "^SNI_TMPL=" "$STATE_FILE" 2>/dev/null | cut -d= -f2)
     FULL_NODE_PORT=${FULL_NODE_PORT:-2222}
     FULL_SNI_PORT=${FULL_SNI_PORT:-9000}
+    FULL_SNI_TMPL=${FULL_SNI_TMPL:-6}
     if [[ -z "$FULL_SECRET_KEY" ]]; then
       warn "Secret Key не найден в сохранённых данных — введи заново"
       read -p "  Secret Key ноды: " FULL_SECRET_KEY
@@ -1544,15 +1546,27 @@ menu_full_install() {
     echo -ne "${BOLD}  Установить Self SNI? (y/n):${NC} "
     read -r install_sni_choice
 
-    # Если SNI — спрашиваем домен и порт сразу
+    # Если SNI — спрашиваем домен, порт и шаблон сразу
     FULL_SNI_DOMAIN=""
     FULL_SNI_PORT="9000"
+    FULL_SNI_TMPL="6"
     if [[ $install_sni_choice =~ ^[Yy]$ ]]; then
       echo ""
       read -p "  Домен для Self SNI: " FULL_SNI_DOMAIN
       [[ -z "$FULL_SNI_DOMAIN" ]] && { warn "Домен не может быть пустым"; return; }
       read -p "  Внутренний SNI порт (Enter для 9000): " FULL_SNI_PORT
       FULL_SNI_PORT=${FULL_SNI_PORT:-9000}
+      echo ""
+      echo -e "  ${CYAN}Шаблон сайта:${NC}"
+      echo -e "    ${YELLOW}1)${NC} Бизнес / Корпоративный"
+      echo -e "    ${YELLOW}2)${NC} Портфолио / Агентство"
+      echo -e "    ${YELLOW}3)${NC} Технологии / SaaS"
+      echo -e "    ${YELLOW}4)${NC} Блог / Медиа"
+      echo -e "    ${YELLOW}5)${NC} Личный сайт"
+      echo -e "    ${YELLOW}6)${NC} Случайный из коллекции"
+      echo -e "    ${YELLOW}7)${NC} Свой шаблон (установлю сам)"
+      read -p "  Номер шаблона (Enter для 6): " FULL_SNI_TMPL
+      FULL_SNI_TMPL=${FULL_SNI_TMPL:-6}
     fi
 
     # IP панели
@@ -1582,7 +1596,13 @@ menu_full_install() {
     # Итоговый экран подтверждения
     echo ""
     echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
-    echo -e "  ${DIM}Self SNI:   $(echo "$install_sni_choice" | grep -qi y && echo "да (${FULL_SNI_DOMAIN}:${FULL_SNI_PORT})" || echo "нет")${NC}"
+    if [[ $install_sni_choice =~ ^[Yy]$ ]]; then
+      local tmpl_names=("" "Бизнес/Корпоративный" "Портфолио/Агентство" "Технологии/SaaS" "Блог/Медиа" "Личный сайт" "Случайный" "Свой шаблон")
+      echo -e "  ${DIM}Self SNI:   да (${FULL_SNI_DOMAIN}:${FULL_SNI_PORT})${NC}"
+      echo -e "  ${DIM}Шаблон:     [${FULL_SNI_TMPL}] ${tmpl_names[$FULL_SNI_TMPL]:-Случайный}${NC}"
+    else
+      echo -e "  ${DIM}Self SNI:   нет${NC}"
+    fi
     echo -e "  ${DIM}Порт ноды:  ${FULL_NODE_PORT}${NC}"
     echo -e "  ${DIM}Secret Key: ${FULL_SECRET_KEY:0:8}...${NC}"
     [[ -n "$FULL_PANEL_IP" ]] && echo -e "  ${DIM}IP панели:  ${FULL_PANEL_IP}${NC}"
@@ -1596,6 +1616,7 @@ menu_full_install() {
     echo "SNI_CHOICE=${install_sni_choice}" > "$STATE_FILE"
     echo "SNI_DOMAIN=${FULL_SNI_DOMAIN}" >> "$STATE_FILE"
     echo "SNI_PORT=${FULL_SNI_PORT}" >> "$STATE_FILE"
+    echo "SNI_TMPL=${FULL_SNI_TMPL}" >> "$STATE_FILE"
     echo "NODE_PORT=${FULL_NODE_PORT}" >> "$STATE_FILE"
     echo "SECRET_KEY=${FULL_SECRET_KEY}" >> "$STATE_FILE"
     [[ -n "$FULL_PANEL_IP" ]] && echo "PANEL_IP=${FULL_PANEL_IP}" >> "$STATE_FILE"
@@ -1626,7 +1647,7 @@ menu_full_install() {
     if ! state_done "selfsni"; then
       echo ""
       echo -e "${BOLD}${CYAN}══ ШАГ 2/3 — Self SNI ${DIM}(устанавливается до ноды)${NC}"
-      run_step "Self SNI" "_install_selfsni_with_params \"$FULL_SNI_DOMAIN\" \"$FULL_SNI_PORT\""
+      run_step "Self SNI" "_install_selfsni_with_params \"$FULL_SNI_DOMAIN\" \"$FULL_SNI_PORT\" \"$FULL_SNI_TMPL\""
       state_set "selfsni"
     else
       info "ШАГ 2/3 — Self SNI уже установлен, пропускаю"
