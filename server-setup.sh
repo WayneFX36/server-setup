@@ -1409,6 +1409,46 @@ BANNER
 }
 
 # ─── Меню 1: Установка компонентов ───────────────────────────
+install_node_accelerator() {
+  step "Установка Node Accelerator"
+
+  if [[ -d /opt/node-accelerator ]]; then
+    info "Node Accelerator уже установлен в /opt/node-accelerator"
+    echo -ne "${BOLD}  Обновить (git pull)? (y/n):${NC} "
+    read -r upd
+    if [[ $upd =~ ^[Yy]$ ]]; then
+      if run_with_spinner "cd /opt/node-accelerator && git pull" "Обновление Node Accelerator..."; then
+        log "Node Accelerator обновлён"
+      else
+        warn "Не удалось обновить Node Accelerator"
+      fi
+    fi
+    return
+  fi
+
+  # Убедимся что git установлен
+  if ! command -v git &>/dev/null; then
+    case "$FAMILY" in
+      debian) DEBIAN_FRONTEND=noninteractive apt-get install -y git ;;
+      rhel)   dnf install -y git ;;
+    esac
+  fi
+
+  if run_with_spinner "git clone https://github.com/jestivald/node-accelerator.git /opt/node-accelerator" "Клонирование node-accelerator..."; then
+    log "Node Accelerator установлен в /opt/node-accelerator"
+    echo ""
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Путь:${NC} /opt/node-accelerator"
+    if [[ -f /opt/node-accelerator/README.md ]]; then
+      echo -e "  ${YELLOW}README:${NC} /opt/node-accelerator/README.md"
+    fi
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  else
+    warn "Не удалось клонировать node-accelerator"
+    return 1
+  fi
+}
+
 menu_components() {
   while true; do
     print_banner
@@ -1431,6 +1471,7 @@ menu_components() {
     echo -e "  ${CYAN}[12]${NC} Logrotate — RemnaNode"
     echo -e "  ${CYAN}[13]${NC} Self SNI"
     echo -e "  ${CYAN}[14]${NC} Remnanode"
+    echo -e "  ${CYAN}[16]${NC} Node Accelerator"
     echo ""
     echo -e "  ${GREEN}[15]${NC} ${BOLD}Установить всё${NC} ${DIM}(настройка сервера без ноды и SNI)${NC}"
     echo ""
@@ -1454,6 +1495,7 @@ menu_components() {
       12) setup_logrotate_remnanode ;;
       13) install_selfsni ;;
       14) install_remnanode ;;
+      16) install_node_accelerator ;;
       15)
         setup_swap
         setup_dns
@@ -1664,6 +1706,15 @@ menu_full_install() {
     state_set "remnanode"
   else
     info "ШАГ 3/3 — Remnanode уже установлен, пропускаю"
+  fi
+
+  # Node Accelerator
+  if ! state_done "node_accelerator"; then
+    echo ""
+    run_step "Node Accelerator" install_node_accelerator
+    state_set "node_accelerator"
+  else
+    info "Node Accelerator уже установлен, пропускаю"
   fi
 
   # Применяем IP-фильтрацию
