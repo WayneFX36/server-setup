@@ -614,17 +614,6 @@ _install_selfsni_with_params() {
   fi
   log "DNS корректен: $SNI_DOMAIN → $domain_ip"
 
-  # Остановка nginx
-  systemctl stop nginx 2>/dev/null || true
-
-  # Проверяем порты — но только на процессы кроме nginx
-  # При полной установке Xray/remnanode может занимать 443, это нормально
-  port80_owner=$(ss -tlnp | grep ":80 " | grep -v nginx | head -1)
-  if [[ -n "$port80_owner" ]]; then
-    warn "Порт 80 занят другим процессом: $port80_owner"
-    warn "certbot не сможет получить сертификат standalone методом"
-  fi
-
   # Открытие портов в firewall
   case "$FAMILY" in
     debian)
@@ -657,26 +646,33 @@ _install_selfsni_with_params() {
       log "Шаблон установлен"
     else
       rm -rf "$TEMP_DIR"
-      err "Не удалось загрузить шаблон"
+      warn "Не удалось загрузить шаблон"
+      return 1
     fi
     rm -rf "$TEMP_DIR"
   fi
 
-  # SSL сертификат — используем webroot если порт 80 занят, standalone если свободен
+  # SSL сертификат
+  # Останавливаем nginx перед standalone чтобы освободить порт 80
+  systemctl stop nginx 2>/dev/null || true
+  sleep 1
+
+  # Проверяем свободен ли порт 80 после остановки nginx
   if ss -tlnp | grep -q ":80 "; then
-    # Порт 80 занят — используем webroot метод через nginx
+    # Порт 80 занят чем-то другим — используем webroot через временный nginx на 8080
+    warn "Порт 80 занят — использую webroot метод"
     mkdir -p "$NGINX_WEBROOT_BASE/.well-known/acme-challenge"
-    # Временный конфиг для получения сертификата
     if [[ "$FAMILY" == "debian" ]]; then
       cat > /etc/nginx/sites-available/sni-temp.conf << TEMPEOF
 server {
-    listen 80;
+    listen 8080;
     server_name ${SNI_DOMAIN};
     root ${NGINX_WEBROOT_BASE};
     location /.well-known/acme-challenge/ { allow all; }
 }
 TEMPEOF
       ln -sf /etc/nginx/sites-available/sni-temp.conf /etc/nginx/sites-enabled/sni-temp.conf
+      rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     else
       cat > /etc/nginx/conf.d/sni-temp.conf << TEMPEOF
 server {
@@ -687,24 +683,24 @@ server {
 }
 TEMPEOF
     fi
-    systemctl enable nginx > /dev/null 2>&1
     nginx -t > /dev/null 2>&1 && systemctl start nginx 2>/dev/null || true
-    if run_with_spinner "certbot certonly --webroot -w $NGINX_WEBROOT_BASE -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата (webroot)..."; then
-      log "SSL сертификат получен"
-    else
-      err "Не удалось получить SSL сертификат"
+    if ! run_with_spinner "certbot certonly --webroot -w $NGINX_WEBROOT_BASE -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата (webroot)..."; then
+      rm -f /etc/nginx/sites-enabled/sni-temp.conf /etc/nginx/sites-available/sni-temp.conf 2>/dev/null || true
+      rm -f /etc/nginx/conf.d/sni-temp.conf 2>/dev/null || true
+      warn "Не удалось получить SSL сертификат"
+      return 1
     fi
-    # Удаляем временный конфиг
     rm -f /etc/nginx/sites-enabled/sni-temp.conf /etc/nginx/sites-available/sni-temp.conf 2>/dev/null || true
     rm -f /etc/nginx/conf.d/sni-temp.conf 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
   else
     # Порт 80 свободен — standalone
-    if run_with_spinner "certbot certonly --standalone -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата (standalone)..."; then
-      log "SSL сертификат получен"
-    else
-      err "Не удалось получить SSL сертификат"
+    if ! run_with_spinner "certbot certonly --standalone -d $SNI_DOMAIN --agree-tos -m admin@$SNI_DOMAIN --non-interactive" "Получение SSL сертификата (standalone)..."; then
+      warn "Не удалось получить SSL сертификат"
+      return 1
     fi
   fi
+  log "SSL сертификат получен"
 
   # Автопродление
   if systemctl list-timers 2>/dev/null | grep -q certbot.timer; then
